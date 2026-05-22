@@ -1,0 +1,4044 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+╔══════════════════════════════════════════════════════════════╗
+  ⚜️  ARION SCAM BASE  v15.0  ⚜️
+  ★ ▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬ ★
+
+  pip install aiogram==3.7.0 aiosqlite aiohttp python-dotenv
+  python arion_scambase_v15.py
+
+  ★ ▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬ ★
+╚══════════════════════════════════════════════════════════════╝
+
+Changelog v15.0 (fixes от v14.1):
+  [FIX]  RotatingFileHandler вместо обычного FileHandler (5 MB × 5 файлов)
+  [FIX]  db_count — параметризованные запросы, whitelist таблиц (защита от SQL-инъекций)
+  [FIX]  Даты варнов — ISO-формат YYYY-MM-DD HH:MM для корректного сравнения в SQLite
+  [FIX]  IsStaffFilter добавлен на колбэки cons:, modcons:, aprev:, apmod: (любой не мог принять жалобу)
+  [FIX]  button_stats и cmd_admin — убраны chr()-хаки, чистые строки запросов
+  [IMP]  _now_iso() — отдельная функция для полей сравнения в БД
+"""
+
+from __future__ import annotations
+
+import asyncio
+import csv
+import io
+import logging
+import os
+import random
+import re
+import signal
+import sys
+import time
+from datetime import datetime, timedelta
+from functools import wraps
+from typing import Any, Dict, List, Optional, Tuple
+
+from dotenv import load_dotenv
+
+load_dotenv()
+
+import aiosqlite
+from aiohttp import web
+from aiogram import Bot, Dispatcher, F, Router
+from aiogram.exceptions import (
+    TelegramBadRequest,
+    TelegramForbiddenError,
+    TelegramRetryAfter,
+)
+from aiogram.filters import BaseFilter, Command, CommandStart
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.types import (
+    BufferedInputFile,
+    CallbackQuery,
+    ChatPermissions,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    KeyboardButton,
+    Message,
+    ReplyKeyboardMarkup,
+    WebAppInfo,
+    BotCommand,
+)
+
+# ══════════════════════════════════════════════════════════════
+#  РАЗДЕЛ 1 — КОНФИГУРАЦИЯ
+# ══════════════════════════════════════════════════════════════
+
+def _env_str(key: str, default: str = "") -> str:
+    val = os.getenv(key)
+    return val if val is not None else default
+
+def _env_int(key: str, default: int = 0) -> int:
+    val = os.getenv(key)
+    if val is None or val.strip() == "":
+        return default
+    try:
+        return int(val.strip())
+    except ValueError:
+        return default
+
+BOT_TOKEN             = ("8664913809:AAETuzeGPS4xJ-wrmQz00kg9QypyOLSugjs")
+MAIN_ADMIN_ID         = ("7156615210")
+CONSIDERATION_CHAT_ID = ("-1003854589019")
+REPORT_CHAT_ID        = ("-1003948546635")
+CONS_GROUP_CHAT_ID    = ("-1003951489932")
+APPEAL_CHAT_ID        = ("-1003961606695")
+API_PORT              = ("8080")
+API_SECRET            = ("ArionNewLegendaryProjecr")
+MINI_APP_URL          = ("https://vetertehas.github.io/ArionScamBase-MiniApp/")
+
+# ══════════════════════════════════════════════════════════════
+#  ХАРДКОД — ЗАПОЛНИ ЕСЛИ load_dotenv() НЕ РАБОТАЕТ (Pydroid3)
+# ══════════════════════════════════════════════════════════════
+# Если бот не видит тебя как главного админа — раскомментируй
+# строки ниже и вставь свои данные напрямую:
+#
+# BOT_TOKEN    = "1234567890:AAxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+# MAIN_ADMIN_ID = 7156615210   ← твой Telegram ID
+# API_SECRET   = "мой_секрет"
+#
+# После этого перезапусти бота.
+# ══════════════════════════════════════════════════════════════
+
+OTHER_BOTS: Dict[str, str] = {}
+_raw_other = os.getenv("OTHER_BOTS", "")
+if _raw_other:
+    for _item in _raw_other.split(","):
+        if ":" in _item:
+            _name, _token = _item.split(":", 1)
+            OTHER_BOTS[_name.strip()] = _token.strip()
+
+if not OTHER_BOTS:
+    OTHER_BOTS = {
+    "Forum":     "ForumBaseRobot",
+    "Syndicate": "scambasenft_bot",
+    "TonTake":   "TonTakeScammersBot",
+    "Gid":       "GidbanBot",
+    "SafeBase":  "SafeBase_checkbot",
+}
+
+DB_PATH        = "arion_shared.db"
+DESIGN_DB_PATH = "arion_design.db"
+
+RATE_LIMIT_SECONDS   = 3
+FSM_TIMEOUT_SEC      = 600
+ROLE_CACHE_TTL       = 120
+BROADCAST_BATCH_SIZE = 25
+BROADCAST_COOLDOWN   = 0.05
+
+# ══════════════════════════════════════════════════════════════
+#  РАЗДЕЛ 2 — ДИЗАЙН / КОНСТАНТЫ
+# ══════════════════════════════════════════════════════════════
+
+DIVIDER = "★ ▬▬▬▬▬▬▬▬▬▬ ★"
+HEADER  = "⚜️ ⋙ ARION SCAM BASE ⋘ ⚜️"
+FOOTER  = "🛡️ Защищено системой ARION | v15.0"
+LINE    = "━━━━━━━━━━━━━━━━━━━━━━"
+
+STATUS_EMOJI: Dict[str, str] = {
+    "scammer":   "🔥",
+    "guarantor": "💎",
+    "trusted":   "🫧",
+}
+
+ROLE_LABELS: Dict[str, str] = {
+    "head_admin": "👑 Главный Администратор",
+    "admin":      "🛡️ Администратор",
+    "guarantor":  "💎 Гарант",
+    "reviewer":   "🔍 Валидатор",
+    "moderator":  "⚖️ Арбитр",
+}
+
+MOD_RANKS: List[Tuple[str, int]] = [
+    ("Бронза",   35),
+    ("Железо",   35),
+    ("Медь",     35),
+    ("Серебро",  50),
+    ("Золото",   50),
+    ("Платина",  50),
+    ("Алмаз",    75),
+    ("Сапфир",   75),
+    ("Рубин",    75),
+    ("Семицвет",  0),
+]
+
+RANK_EMOJI: Dict[str, str] = {
+    "Бронза":   "🥉",
+    "Железо":   "⚙️",
+    "Медь":     "🔶",
+    "Серебро":  "🥈",
+    "Золото":   "🥇",
+    "Платина":  "💎",
+    "Алмаз":    "💠",
+    "Сапфир":   "🔷",
+    "Рубин":    "🔴",
+    "Семицвет": "🌈",
+}
+
+DEFAULT_TEXTS: Dict[str, str] = {
+    "welcome_admin": (
+        f"{HEADER}\n{DIVIDER}\n\n"
+        f"💎 *Добро пожаловать в ARION SCAM BASE*\n\n"
+        f"Вы авторизованы как сотрудник системы защиты.\n"
+        f"Ваши действия фиксируются и влияют на безопасность сообщества.\n\n"
+        f"{DIVIDER}\n\n"
+        f"⚔️ *Доступные операции:*\n\n"
+        f"🔎 ПРОВЕРИТЬ — проверка по базе данных\n"
+        f"📋 ИСТОРИЯ — архив ваших запросов\n"
+        f"📊 СТАТИСТИКА — сводные данные системы\n"
+        f"🗑 СБРОС — управление данными\n"
+        f"📱 MINI APP — веб-доступ к системе\n\n"
+        f"{DIVIDER}\n{FOOTER}"
+    ),
+    "welcome_user": (
+        f"{HEADER}\n{DIVIDER}\n\n"
+        f"💎 *Добро пожаловать в ARION SCAM BASE*\n\n"
+        f"Система коллективной защиты от мошенников.\n"
+        f"Проверяйте пользователей перед любыми сделками.\n\n"
+        f"{DIVIDER}\n\n"
+        f"⚔️ *Доступные операции:*\n\n"
+        f"🔎 ПРОВЕРИТЬ — пробить по базе данных\n"
+        f"🚨 ПОЖАЛОВАТЬСЯ — сообщить о мошеннике\n"
+        f"📋 ИСТОРИЯ — архив ваших проверок\n"
+        f"⚖️ АПЕЛЛЯЦИЯ — оспорить запись в базе\n"
+        f"📱 MINI APP — быстрый доступ\n\n"
+        f"{DIVIDER}\n{FOOTER}"
+    ),
+    "check_start":   f"{HEADER}\n{DIVIDER}\n\n🔎 *Запущена проверка*\n\n⚙️ Анализируем данные...\n🔒 Запрос защищён\n\n",
+    "scammer_found": f"{HEADER}\n{DIVIDER}\n\n🔥 *Внимание! Запись найдена!*\n\n⚠️ Статус: *МОШЕННИК*\n🚫 Рекомендация: *НЕ СВЯЗЫВАТЬСЯ*\n\n",
+    "user_clean":    f"{HEADER}\n{DIVIDER}\n\n🫧 *Проверка завершена*\n\n💎 Статус: *ЧИСТ*\n\n✅ В нашей базе компромат не найден.\n⚠️ Сохраняйте бдительность.\n\n{DIVIDER}\n{FOOTER}",
+    "report_start":  f"{HEADER}\n{DIVIDER}\n\n🚨 *Подача жалобы*\n\n📋 Заполните данные о нарушителе.\n🔍 Все жалобы проходят обязательную модерацию.\n⚡ Ложные доносы недопустимы и могут повлечь последствия.\n\n",
+    "report_success": f"{HEADER}\n{DIVIDER}\n\n✅ *Жалоба успешно принята!*\n\n🙏 Благодарим за содействие!\n🔍 Сотрудники рассмотрят её в ближайшее время.\n\n{DIVIDER}\n{FOOTER}",
+    "cons_form":     f"{HEADER}\n{DIVIDER}\n\n📝 *Форма жалобы (/cons)*\n\nЗаполните жалобу:\n\n1️⃣ *ID и @username* нарушителя\n2️⃣ *Причина* — скам / фейк / невозврат\n3️⃣ *Краткое пояснение*\n4️⃣ *Медиа* — скриншоты или видео\n\n{DIVIDER}\n⚡ Когда закончите — отправьте команду */Not*\n\n{FOOTER}",
+    "stats":         f"{HEADER}\n{DIVIDER}\n\n📈 *Сводная статистика системы*\n\n",
+    "history_empty": f"{HEADER}\n{DIVIDER}\n\n📜 *Архив проверок*\n\n🔍 Вы ещё не проводили проверки.\n\n{DIVIDER}\n{FOOTER}",
+}
+
+VERIFICATION_FRUITS = ["🍇", "🍍", "🥭", "🍎"]
+
+# ══════════════════════════════════════════════════════════════
+#  РАЗДЕЛ 3 — ЛОГГИРОВАНИЕ
+# ══════════════════════════════════════════════════════════════
+
+from logging.handlers import RotatingFileHandler as _RotatingFileHandler
+
+_log_fmt = logging.Formatter("%(asctime)s [ArionV15] %(levelname)-8s %(message)s")
+_rot_handler = _RotatingFileHandler(
+    "scambase.log", maxBytes=5 * 1024 * 1024, backupCount=5, encoding="utf-8"
+)
+_rot_handler.setFormatter(_log_fmt)
+_stream_handler = logging.StreamHandler(sys.stdout)
+_stream_handler.setFormatter(_log_fmt)
+
+logging.basicConfig(level=logging.INFO, handlers=[_rot_handler, _stream_handler])
+log = logging.getLogger("ArionV15")
+
+# ══════════════════════════════════════════════════════════════
+#  РАЗДЕЛ 4 — БД: КОНТЕКСТ-МЕНЕДЖЕР
+# ══════════════════════════════════════════════════════════════
+
+class _DB:
+    """Лёгкий async context manager для aiosqlite."""
+
+    __slots__ = ("path", "_conn")
+
+    def __init__(self, path: str) -> None:
+        self.path  = path
+        self._conn: Optional[aiosqlite.Connection] = None
+
+    async def __aenter__(self) -> aiosqlite.Connection:
+        self._conn = await aiosqlite.connect(self.path)
+        self._conn.row_factory = aiosqlite.Row
+        return self._conn
+
+    async def __aexit__(self, *_: Any) -> None:
+        if self._conn:
+            await self._conn.close()
+            self._conn = None
+
+
+def mdb() -> _DB:
+    return _DB(DB_PATH)
+
+
+def ddb() -> _DB:
+    return _DB(DESIGN_DB_PATH)
+
+# ══════════════════════════════════════════════════════════════
+#  РАЗДЕЛ 5 — ИНИЦИАЛИЗАЦИЯ БД
+# ══════════════════════════════════════════════════════════════
+
+_MAIN_SCHEMA = """
+CREATE TABLE IF NOT EXISTS users (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    telegram_id TEXT    UNIQUE,
+    username    TEXT,
+    status      TEXT    DEFAULT 'scammer',
+    reason      TEXT,
+    evidence    TEXT,
+    added_by    TEXT,
+    added_at    TEXT,
+    updated_at  TEXT
+);
+CREATE TABLE IF NOT EXISTS check_history (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    checker_id  TEXT,
+    target_id   TEXT,
+    result      TEXT,
+    checked_at  TEXT
+);
+CREATE TABLE IF NOT EXISTS bot_users (
+    telegram_id INTEGER PRIMARY KEY,
+    username    TEXT,
+    first_name  TEXT,
+    joined_at   TEXT
+);
+CREATE TABLE IF NOT EXISTS reports (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    reporter_id  TEXT,
+    target_id    TEXT,
+    target_un    TEXT,
+    report_type  TEXT,
+    description  TEXT,
+    evidence     TEXT,
+    status       TEXT DEFAULT 'pending',
+    created_at   TEXT,
+    updated_at   TEXT
+);
+CREATE TABLE IF NOT EXISTS cons_reports (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    reporter_id   TEXT,
+    message_text  TEXT,
+    media_file_id TEXT,
+    media_type    TEXT,
+    status        TEXT DEFAULT 'pending_review',
+    created_at    TEXT,
+    updated_at    TEXT
+);
+CREATE TABLE IF NOT EXISTS staff (
+    telegram_id INTEGER PRIMARY KEY,
+    username    TEXT,
+    role        TEXT DEFAULT 'reviewer',
+    added_by    INTEGER,
+    added_at    TEXT
+);
+CREATE TABLE IF NOT EXISTS required_channels (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    channel_id  TEXT UNIQUE,
+    channel_url TEXT,
+    title       TEXT,
+    active      INTEGER DEFAULT 1
+);
+CREATE TABLE IF NOT EXISTS mod_ranks (
+    telegram_id  INTEGER PRIMARY KEY,
+    rank         TEXT    DEFAULT 'Бронза',
+    total_actions INTEGER DEFAULT 0,
+    rank_actions  INTEGER DEFAULT 0,
+    updated_at    TEXT
+);
+CREATE TABLE IF NOT EXISTS system_stats (
+    stat_key   TEXT PRIMARY KEY,
+    stat_value TEXT,
+    updated_at TEXT
+);
+CREATE TABLE IF NOT EXISTS mod_action_log (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    moderator_id TEXT,
+    action       TEXT,
+    target       TEXT,
+    details      TEXT,
+    created_at   TEXT
+);
+CREATE TABLE IF NOT EXISTS appeals (
+    id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+    appellant_id       TEXT,
+    appellant_username TEXT,
+    target_id          TEXT,
+    reason             TEXT,
+    evidence           TEXT,
+    status             TEXT DEFAULT 'pending',
+    reviewer_id        TEXT,
+    moderator_id       TEXT,
+    reviewer_note      TEXT,
+    moderator_note     TEXT,
+    created_at         TEXT,
+    updated_at         TEXT
+);
+CREATE TABLE IF NOT EXISTS user_verification (
+    telegram_id INTEGER PRIMARY KEY,
+    verified    INTEGER DEFAULT 0,
+    verified_at TEXT
+);
+CREATE TABLE IF NOT EXISTS warnings (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id    INTEGER,
+    chat_id    INTEGER,
+    issued_by  INTEGER,
+    reason     TEXT,
+    expires_at TEXT,
+    issued_at  TEXT
+);
+CREATE TABLE IF NOT EXISTS job_applications (
+    id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+    applicant_id         INTEGER,
+    username             TEXT,
+    age                  INTEGER,
+    communication_rating INTEGER,
+    reason_why           TEXT,
+    reason_motivation    TEXT,
+    status               TEXT DEFAULT 'pending',
+    created_at           TEXT
+);
+CREATE TABLE IF NOT EXISTS recruitment_settings (
+    id                      INTEGER PRIMARY KEY CHECK (id = 1),
+    is_open                 INTEGER DEFAULT 1,
+    needed_moderators       INTEGER DEFAULT 3,
+    needed_reviewers        INTEGER DEFAULT 3,
+    needed_appeal_reviewers INTEGER DEFAULT 2,
+    updated_by              INTEGER,
+    updated_at              TEXT
+);
+"""
+
+_DESIGN_SCHEMA = """
+CREATE TABLE IF NOT EXISTS banners (
+    name       TEXT PRIMARY KEY,
+    file_id    TEXT,
+    file_type  TEXT DEFAULT 'gif',
+    updated_at TEXT
+);
+CREATE TABLE IF NOT EXISTS texts (
+    name       TEXT PRIMARY KEY,
+    content    TEXT,
+    updated_at TEXT
+);
+"""
+
+_STAT_KEYS = ("checks", "found", "clean", "reports", "appeals_approved", "appeals_rejected")
+
+
+async def init_db() -> None:
+    async with mdb() as db:
+        await db.executescript(_MAIN_SCHEMA)
+        await db.commit()
+
+        _now = _now_str()
+        for key in _STAT_KEYS:
+            await db.execute(
+                "INSERT OR IGNORE INTO system_stats (stat_key, stat_value, updated_at) VALUES (?, '0', ?)",
+                (key, _now),
+            )
+        await db.execute(
+            "INSERT OR IGNORE INTO recruitment_settings "
+            "(id, is_open, needed_moderators, needed_reviewers, needed_appeal_reviewers, updated_at) "
+            "VALUES (1, 1, 3, 3, 2, ?)",
+            (_now,),
+        )
+        await db.commit()
+
+    async with ddb() as db:
+        await db.executescript(_DESIGN_SCHEMA)
+        await db.commit()
+
+        _now = _now_str()
+        for name, content in DEFAULT_TEXTS.items():
+            await db.execute(
+                "INSERT OR IGNORE INTO texts (name, content, updated_at) VALUES (?, ?, ?)",
+                (name, content, _now),
+            )
+        await db.commit()
+
+    log.info("✅ БД инициализирована")
+
+# ══════════════════════════════════════════════════════════════
+#  РАЗДЕЛ 6 — ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
+# ══════════════════════════════════════════════════════════════
+
+def _now_str() -> str:
+    """Human-readable datetime used in display fields."""
+    return datetime.now().strftime("%d.%m.%Y %H:%M")
+
+
+def _now_iso() -> str:
+    """ISO-format datetime used in DB comparison fields (warnings, bans)."""
+    return datetime.now().strftime("%Y-%m-%d %H:%M")
+
+
+def sanitize(text: Any) -> str:
+    if not text:
+        return ""
+    return str(text).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def validate_identifier(identifier: str) -> Optional[str]:
+    ident = identifier.strip().lstrip("@")
+    if re.match(r"^[a-zA-Z0-9_]{4,32}$|^\d{5,15}$", ident):
+        return ident
+    return None
+
+
+def progress_bar(pct: int) -> str:
+    filled = int(10 * pct / 100)
+    return f"[{'█' * filled}{'░' * (10 - filled)}] {pct}%"
+
+
+def parse_time_delta(text: str) -> Optional[timedelta]:
+    """Парсит строку '5 days' / '15 hours' / '30 minutes' → timedelta."""
+    if not text:
+        return None
+    m = re.match(r"(\d+)\s*(day|days|d|hour|hours|h|minute|minutes|min|m)", text.lower())
+    if not m:
+        return None
+    value, unit = int(m.group(1)), m.group(2)
+    if unit.startswith("d"):
+        return timedelta(days=value)
+    if unit.startswith("h"):
+        return timedelta(hours=value)
+    return timedelta(minutes=value)
+
+# ══════════════════════════════════════════════════════════════
+#  РАЗДЕЛ 7 — КЭШИ: RATE LIMIT / РОЛИ
+# ══════════════════════════════════════════════════════════════
+
+_rl_cache: Dict[int, float] = {}
+_rl_lock  = asyncio.Lock()
+
+
+async def rate_ok(user_id: int) -> bool:
+    async with _rl_lock:
+        now = time.monotonic()
+        if now - _rl_cache.get(user_id, 0.0) < RATE_LIMIT_SECONDS:
+            return False
+        _rl_cache[user_id] = now
+        if len(_rl_cache) > 50_000:
+            cutoff = now - 3600
+            for uid in [u for u, ts in list(_rl_cache.items()) if ts < cutoff]:
+                del _rl_cache[uid]
+        return True
+
+
+_role_cache: Dict[int, Tuple[Optional[str], float]] = {}
+_role_lock  = asyncio.Lock()
+
+
+async def get_role(telegram_id: int) -> Optional[str]:
+    if telegram_id == MAIN_ADMIN_ID:
+        return "head_admin"
+    async with _role_lock:
+        entry = _role_cache.get(telegram_id)
+        if entry and time.monotonic() - entry[1] < ROLE_CACHE_TTL:
+            return entry[0]
+    try:
+        async with mdb() as db:
+            cur = await db.execute(
+                "SELECT role FROM staff WHERE telegram_id=?", (telegram_id,)
+            )
+            row = await cur.fetchone()
+        role: Optional[str] = row["role"] if row else None
+    except Exception:
+        role = None
+    async with _role_lock:
+        _role_cache[telegram_id] = (role, time.monotonic())
+    return role
+
+
+def invalidate_role(telegram_id: int) -> None:
+    _role_cache.pop(telegram_id, None)
+
+# ══════════════════════════════════════════════════════════════
+#  РАЗДЕЛ 8 — FSM ТАЙМЕРЫ
+# ══════════════════════════════════════════════════════════════
+
+_fsm_timers: Dict[int, asyncio.TimerHandle] = {}
+
+
+def fsm_schedule(user_id: int, state: FSMContext) -> None:
+    if user_id in _fsm_timers:
+        _fsm_timers[user_id].cancel()
+
+    async def _clear() -> None:
+        if await state.get_state():
+            await state.clear()
+
+    loop = asyncio.get_running_loop()
+    _fsm_timers[user_id] = loop.call_later(
+        FSM_TIMEOUT_SEC,
+        lambda: asyncio.create_task(_clear()),
+    )
+
+
+def fsm_cancel(user_id: int) -> None:
+    handle = _fsm_timers.pop(user_id, None)
+    if handle:
+        handle.cancel()
+
+# ══════════════════════════════════════════════════════════════
+#  РАЗДЕЛ 9 — БД: БАЗОВЫЕ ОПЕРАЦИИ
+# ══════════════════════════════════════════════════════════════
+
+async def mod_log(moderator_id: str, action: str, target: str, details: str = "") -> None:
+    try:
+        async with mdb() as db:
+            await db.execute(
+                "INSERT INTO mod_action_log (moderator_id, action, target, details, created_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (moderator_id, action, target, details, _now_str()),
+            )
+            await db.commit()
+    except Exception as exc:
+        log.error("mod_log: %s", exc)
+
+
+async def inc_stat(key: str, delta: int = 1) -> None:
+    try:
+        async with mdb() as db:
+            cur = await db.execute(
+                "SELECT stat_value FROM system_stats WHERE stat_key=?", (key,)
+            )
+            row = await cur.fetchone()
+            val = int(row[0]) if row else 0
+            await db.execute(
+                "INSERT OR REPLACE INTO system_stats (stat_key, stat_value, updated_at) "
+                "VALUES (?, ?, ?)",
+                (key, str(val + delta), _now_str()),
+            )
+            await db.commit()
+    except Exception as exc:
+        log.error("inc_stat %s: %s", key, exc)
+
+
+async def get_all_stats() -> Dict[str, int]:
+    result: Dict[str, int] = {k: 0 for k in _STAT_KEYS}
+    try:
+        async with mdb() as db:
+            cur = await db.execute("SELECT stat_key, stat_value FROM system_stats")
+            for row in await cur.fetchall():
+                if row["stat_key"] in result:
+                    result[row["stat_key"]] = int(row["stat_value"])
+    except Exception as exc:
+        log.error("get_all_stats: %s", exc)
+    return result
+
+
+_ALLOWED_TABLES = frozenset({
+    "users", "check_history", "bot_users", "reports", "cons_reports",
+    "staff", "required_channels", "mod_ranks", "system_stats", "mod_action_log",
+    "appeals", "user_verification", "warnings", "job_applications",
+    "recruitment_settings",
+})
+
+# Mapping of known where-clause presets to safe parameterised forms
+_WHERE_PRESETS: Dict[str, Tuple[str, Tuple]] = {
+    "active=1":                        ("active=?",          (1,)),
+    "status='pending'":                ("status=?",          ("pending",)),
+    "status='pending_review'":         ("status=?",          ("pending_review",)),
+    "status='reviewer_approved'":      ("status=?",          ("reviewer_approved",)),
+    "status='scammer'":                ("status=?",          ("scammer",)),
+    "status='guarantor'":              ("status=?",          ("guarantor",)),
+    "status='trusted'":                ("status=?",          ("trusted",)),
+}
+
+
+async def db_count(table: str, where: str = "") -> int:
+    if table not in _ALLOWED_TABLES:
+        log.warning("db_count: disallowed table '%s'", table)
+        return 0
+    try:
+        if where:
+            preset = _WHERE_PRESETS.get(where)
+            if preset:
+                clause, params = preset
+                q = f"SELECT COUNT(*) FROM {table} WHERE {clause}"
+                async with mdb() as db:
+                    cur = await db.execute(q, params)
+                    row = await cur.fetchone()
+            else:
+                # Fallback for legacy callers — strip anything dangerous
+                safe_where = re.sub(r"[;'\"]", "", where)
+                q = f"SELECT COUNT(*) FROM {table} WHERE {safe_where}"
+                log.warning("db_count: non-preset where='%s', sanitised", where)
+                async with mdb() as db:
+                    cur = await db.execute(q)
+                    row = await cur.fetchone()
+        else:
+            async with mdb() as db:
+                cur = await db.execute(f"SELECT COUNT(*) FROM {table}")
+                row = await cur.fetchone()
+        return row[0] if row else 0
+    except Exception as exc:
+        log.error("db_count(%s, %s): %s", table, where, exc)
+        return 0
+
+
+async def db_register_user(user: Any) -> None:
+    try:
+        async with mdb() as db:
+            await db.execute(
+                "INSERT OR IGNORE INTO bot_users (telegram_id, username, first_name, joined_at) "
+                "VALUES (?, ?, ?, ?)",
+                (user.id, user.username, user.first_name, _now_str()),
+            )
+            await db.commit()
+    except Exception as exc:
+        log.error("db_register_user: %s", exc)
+
+
+async def is_user_verified(telegram_id: int) -> bool:
+    try:
+        async with mdb() as db:
+            cur = await db.execute(
+                "SELECT verified FROM user_verification WHERE telegram_id=?", (telegram_id,)
+            )
+            row = await cur.fetchone()
+        return bool(row and row["verified"])
+    except Exception:
+        return False
+
+
+async def mark_verified(telegram_id: int) -> None:
+    async with mdb() as db:
+        await db.execute(
+            "INSERT OR REPLACE INTO user_verification (telegram_id, verified, verified_at) "
+            "VALUES (?, 1, ?)",
+            (telegram_id, _now_str()),
+        )
+        await db.commit()
+
+
+async def db_get_user(identifier: str) -> Optional[aiosqlite.Row]:
+    try:
+        ident = identifier.lstrip("@").lower()
+        async with mdb() as db:
+            cur = await db.execute(
+                "SELECT * FROM users WHERE LOWER(telegram_id)=? OR LOWER(username)=?",
+                (ident, ident),
+            )
+            return await cur.fetchone()
+    except Exception:
+        return None
+
+
+async def db_add_user(
+    telegram_id: str,
+    username: Optional[str],
+    status: str,
+    reason: str,
+    evidence: Optional[str],
+    added_by: str,
+) -> bool:
+    try:
+        _now = _now_str()
+        async with mdb() as db:
+            await db.execute(
+                "INSERT OR REPLACE INTO users "
+                "(telegram_id, username, status, reason, evidence, added_by, added_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (telegram_id, username, status, reason, evidence, added_by, _now, _now),
+            )
+            await db.commit()
+        await mod_log(added_by, "add_user", telegram_id, f"status={status} reason={reason[:80]}")
+        return True
+    except Exception as exc:
+        log.error("db_add_user: %s", exc)
+        return False
+
+
+async def db_delete_user(identifier: str, deleted_by: str = "system") -> bool:
+    try:
+        ident = identifier.lstrip("@").lower()
+        async with mdb() as db:
+            cur = await db.execute(
+                "DELETE FROM users WHERE LOWER(telegram_id)=? OR LOWER(username)=?",
+                (ident, ident),
+            )
+            await db.commit()
+        if cur.rowcount > 0:
+            await mod_log(deleted_by, "delete_user", identifier)
+            return True
+        return False
+    except Exception:
+        return False
+
+
+async def db_add_history(checker_id: str, target_id: str, result: str) -> None:
+    try:
+        async with mdb() as db:
+            await db.execute(
+                "INSERT INTO check_history (checker_id, target_id, result, checked_at) "
+                "VALUES (?, ?, ?, ?)",
+                (checker_id, target_id, result, _now_str()),
+            )
+            await db.commit()
+    except Exception as exc:
+        log.error("db_add_history: %s", exc)
+
+
+async def db_get_history(checker_id: str, limit: int = 5) -> List[aiosqlite.Row]:
+    try:
+        async with mdb() as db:
+            cur = await db.execute(
+                "SELECT target_id, result, checked_at FROM check_history "
+                "WHERE checker_id=? ORDER BY id DESC LIMIT ?",
+                (str(checker_id), limit),
+            )
+            return await cur.fetchall()
+    except Exception:
+        return []
+
+
+async def db_get_channels() -> List[aiosqlite.Row]:
+    try:
+        async with mdb() as db:
+            cur = await db.execute(
+                "SELECT * FROM required_channels WHERE active=1"
+            )
+            return await cur.fetchall()
+    except Exception:
+        return []
+
+
+async def db_add_channel(channel_id: str, url: str, title: str) -> bool:
+    try:
+        async with mdb() as db:
+            await db.execute(
+                "INSERT OR REPLACE INTO required_channels (channel_id, channel_url, title, active) "
+                "VALUES (?, ?, ?, 1)",
+                (channel_id, url, title),
+            )
+            await db.commit()
+        return True
+    except Exception:
+        return False
+
+
+async def db_delete_channel(channel_id: str) -> bool:
+    try:
+        async with mdb() as db:
+            cur = await db.execute(
+                "DELETE FROM required_channels WHERE channel_id=?", (channel_id,)
+            )
+            await db.commit()
+        return cur.rowcount > 0
+    except Exception:
+        return False
+
+
+async def db_get_all_users() -> List[aiosqlite.Row]:
+    try:
+        async with mdb() as db:
+            cur = await db.execute("SELECT telegram_id FROM bot_users")
+            return await cur.fetchall()
+    except Exception:
+        return []
+
+
+async def db_export_csv() -> bytes:
+    async with mdb() as db:
+        cur = await db.execute(
+            "SELECT telegram_id, username, status, reason, evidence, added_by, added_at "
+            "FROM users ORDER BY added_at DESC"
+        )
+        rows = await cur.fetchall()
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow(["telegram_id", "username", "status", "reason", "evidence", "added_by", "added_at"])
+    for row in rows:
+        writer.writerow([row[i] for i in range(7)])
+    return buf.getvalue().encode("utf-8-sig")
+
+
+async def db_clear(target: str) -> None:
+    tables = {"reports": "reports", "users": "users", "history": "check_history"}
+    async with mdb() as db:
+        if target == "all":
+            for t in tables.values():
+                await db.execute(f"DELETE FROM {t}")
+        elif target in tables:
+            await db.execute(f"DELETE FROM {tables[target]}")
+        await db.commit()
+
+# ══════════════════════════════════════════════════════════════
+#  РАЗДЕЛ 10 — БД: ЖАЛОБЫ / CONS / АПЕЛЛЯЦИИ
+# ══════════════════════════════════════════════════════════════
+
+async def db_add_report(
+    reporter_id: str,
+    target_id: str,
+    target_un: str,
+    report_type: str,
+    description: str,
+    evidence: Optional[str],
+) -> Optional[int]:
+    try:
+        async with mdb() as db:
+            cur = await db.execute(
+                "INSERT INTO reports "
+                "(reporter_id, target_id, target_un, report_type, description, evidence, status, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, 'pending', ?)",
+                (reporter_id, target_id, target_un, report_type, description, evidence, _now_str()),
+            )
+            await db.commit()
+            return cur.lastrowid
+    except Exception:
+        return None
+
+
+async def db_update_report_status(report_id: int, status: str) -> None:
+    try:
+        async with mdb() as db:
+            await db.execute(
+                "UPDATE reports SET status=?, updated_at=? WHERE id=?",
+                (status, _now_str(), report_id),
+            )
+            await db.commit()
+    except Exception as exc:
+        log.error("db_update_report_status: %s", exc)
+
+
+async def db_pending_reports(limit: int = 5) -> List[aiosqlite.Row]:
+    try:
+        async with mdb() as db:
+            cur = await db.execute(
+                "SELECT * FROM reports WHERE status='pending' ORDER BY id ASC LIMIT ?", (limit,)
+            )
+            return await cur.fetchall()
+    except Exception:
+        return []
+
+
+async def db_save_cons(
+    reporter_id: str,
+    text: str,
+    media_id: Optional[str],
+    media_type: Optional[str],
+) -> Optional[int]:
+    try:
+        async with mdb() as db:
+            cur = await db.execute(
+                "INSERT INTO cons_reports "
+                "(reporter_id, message_text, media_file_id, media_type, status, created_at) "
+                "VALUES (?, ?, ?, ?, 'pending_review', ?)",
+                (reporter_id, text, media_id, media_type, _now_str()),
+            )
+            await db.commit()
+            return cur.lastrowid
+    except Exception:
+        return None
+
+
+async def db_get_cons(cons_id: int) -> Optional[aiosqlite.Row]:
+    try:
+        async with mdb() as db:
+            cur = await db.execute(
+                "SELECT * FROM cons_reports WHERE id=?", (cons_id,)
+            )
+            return await cur.fetchone()
+    except Exception:
+        return None
+
+
+async def db_update_cons_status(cons_id: int, status: str) -> None:
+    try:
+        async with mdb() as db:
+            await db.execute(
+                "UPDATE cons_reports SET status=?, updated_at=? WHERE id=?",
+                (status, _now_str(), cons_id),
+            )
+            await db.commit()
+    except Exception:
+        pass
+
+
+async def db_pending_cons(limit: int = 10) -> List[aiosqlite.Row]:
+    try:
+        async with mdb() as db:
+            cur = await db.execute(
+                "SELECT * FROM cons_reports WHERE status='pending_review' ORDER BY id ASC LIMIT ?",
+                (limit,),
+            )
+            return await cur.fetchall()
+    except Exception:
+        return []
+
+
+async def db_create_appeal(
+    appellant_id: str,
+    appellant_username: str,
+    target_id: str,
+    reason: str,
+    evidence: Optional[str],
+) -> Optional[int]:
+    try:
+        async with mdb() as db:
+            cur = await db.execute(
+                "INSERT INTO appeals "
+                "(appellant_id, appellant_username, target_id, reason, evidence, status, created_at) "
+                "VALUES (?, ?, ?, ?, ?, 'pending', ?)",
+                (appellant_id, appellant_username, target_id, reason, evidence, _now_str()),
+            )
+            await db.commit()
+            return cur.lastrowid
+    except Exception as exc:
+        log.error("db_create_appeal: %s", exc)
+        return None
+
+
+async def db_get_appeal(appeal_id: int) -> Optional[aiosqlite.Row]:
+    try:
+        async with mdb() as db:
+            cur = await db.execute(
+                "SELECT * FROM appeals WHERE id=?", (appeal_id,)
+            )
+            return await cur.fetchone()
+    except Exception:
+        return None
+
+
+async def db_update_appeal(appeal_id: int, **kwargs: Any) -> None:
+    if not kwargs:
+        return
+    try:
+        sets = ", ".join(f"{k}=?" for k in kwargs)
+        vals = list(kwargs.values()) + [_now_str(), appeal_id]
+        async with mdb() as db:
+            await db.execute(
+                f"UPDATE appeals SET {sets}, updated_at=? WHERE id=?", vals
+            )
+            await db.commit()
+    except Exception as exc:
+        log.error("db_update_appeal: %s", exc)
+
+
+async def db_pending_appeals(stage: str = "pending", limit: int = 10) -> List[aiosqlite.Row]:
+    try:
+        async with mdb() as db:
+            cur = await db.execute(
+                "SELECT * FROM appeals WHERE status=? ORDER BY id ASC LIMIT ?",
+                (stage, limit),
+            )
+            return await cur.fetchall()
+    except Exception:
+        return []
+
+
+async def db_check_open_appeal(target_id: str) -> bool:
+    try:
+        ident = target_id.lstrip("@").lower()
+        async with mdb() as db:
+            cur = await db.execute(
+                "SELECT id FROM appeals WHERE LOWER(target_id)=? "
+                "AND status NOT IN ('approved','rejected') LIMIT 1",
+                (ident,),
+            )
+            return await cur.fetchone() is not None
+    except Exception:
+        return False
+
+# ══════════════════════════════════════════════════════════════
+#  РАЗДЕЛ 11 — БД: ВАРНЫ (ИСПРАВЛЕНО)
+# ══════════════════════════════════════════════════════════════
+
+async def add_warning(
+    user_id: int,
+    chat_id: int,
+    issued_by: int,
+    expires_at: Optional[datetime] = None,
+) -> int:
+    """Добавляет варн и возвращает количество активных варнов.
+    expires_at хранится в ISO-формате (YYYY-MM-DD HH:MM) для корректного сравнения в SQLite.
+    """
+    expires_str = expires_at.strftime("%Y-%m-%d %H:%M") if expires_at else None
+    async with mdb() as db:
+        await db.execute(
+            "INSERT INTO warnings (user_id, chat_id, issued_by, expires_at, issued_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (user_id, chat_id, issued_by, expires_str, _now_iso()),
+        )
+        await db.commit()
+        # Считаем в том же соединении — БД не закрыта
+        cur = await db.execute(
+            "SELECT COUNT(*) FROM warnings "
+            "WHERE user_id=? AND chat_id=? AND (expires_at IS NULL OR expires_at > ?)",
+            (user_id, chat_id, _now_iso()),
+        )
+        row = await cur.fetchone()
+        return row[0] if row else 1
+
+
+async def clear_warnings(user_id: int, chat_id: int) -> None:
+    async with mdb() as db:
+        await db.execute(
+            "DELETE FROM warnings WHERE user_id=? AND chat_id=?", (user_id, chat_id)
+        )
+        await db.commit()
+
+
+async def get_active_warnings_count(user_id: int, chat_id: int) -> int:
+    async with mdb() as db:
+        cur = await db.execute(
+            "SELECT COUNT(*) FROM warnings "
+            "WHERE user_id=? AND chat_id=? AND (expires_at IS NULL OR expires_at > ?)",
+            (user_id, chat_id, _now_iso()),
+        )
+        row = await cur.fetchone()
+        return row[0] if row else 0
+
+# ══════════════════════════════════════════════════════════════
+#  РАЗДЕЛ 12 — БД: РАНГИ
+# ══════════════════════════════════════════════════════════════
+
+async def get_mod_rank(telegram_id: int) -> Tuple[str, int, int]:
+    try:
+        async with mdb() as db:
+            cur = await db.execute(
+                "SELECT rank, total_actions, rank_actions FROM mod_ranks WHERE telegram_id=?",
+                (telegram_id,),
+            )
+            row = await cur.fetchone()
+        if row:
+            return row["rank"], row["total_actions"], row["rank_actions"]
+    except Exception:
+        pass
+    return "Бронза", 0, 0
+
+
+async def update_mod_rank(telegram_id: int, increment: int = 1) -> Optional[str]:
+    role = await get_role(telegram_id)
+    if role not in ("moderator", "reviewer", "admin", "head_admin"):
+        return None
+
+    cur_rank, total, rank_actions = await get_mod_rank(telegram_id)
+    new_rank         = cur_rank
+    new_rank_actions = rank_actions + increment
+    new_total        = total + increment
+    promoted         = False
+
+    rank_index = next((i for i, (r, _) in enumerate(MOD_RANKS) if r == cur_rank), None)
+    if rank_index is None:
+        return None
+
+    need = MOD_RANKS[rank_index][1]
+
+    if cur_rank != "Семицвет" and need > 0 and new_rank_actions >= need:
+        if rank_index + 1 < len(MOD_RANKS):
+            new_rank         = MOD_RANKS[rank_index + 1][0]
+            new_rank_actions = 0
+            promoted         = True
+
+    async with mdb() as db:
+        await db.execute(
+            "INSERT OR REPLACE INTO mod_ranks "
+            "(telegram_id, rank, total_actions, rank_actions, updated_at) VALUES (?, ?, ?, ?, ?)",
+            (telegram_id, new_rank, new_total, new_rank_actions, _now_str()),
+        )
+        await db.commit()
+
+    return new_rank if promoted else None
+
+
+async def set_mod_rank_by_admin(telegram_id: int, new_rank: str) -> bool:
+    if new_rank not in RANK_EMOJI:
+        return False
+    try:
+        async with mdb() as db:
+            cur = await db.execute(
+                "SELECT total_actions FROM mod_ranks WHERE telegram_id=?", (telegram_id,)
+            )
+            row   = await cur.fetchone()
+            total = row["total_actions"] if row else 0
+            await db.execute(
+                "INSERT OR REPLACE INTO mod_ranks "
+                "(telegram_id, rank, total_actions, rank_actions, updated_at) VALUES (?, ?, ?, 0, ?)",
+                (telegram_id, new_rank, total, _now_str()),
+            )
+            await db.commit()
+        return True
+    except Exception:
+        return False
+
+
+async def get_top_moderators(limit: int = 10) -> List[aiosqlite.Row]:
+    async with mdb() as db:
+        cur = await db.execute(
+            "SELECT telegram_id, rank, total_actions FROM mod_ranks "
+            "ORDER BY total_actions DESC LIMIT ?",
+            (limit,),
+        )
+        return await cur.fetchall()
+
+# ══════════════════════════════════════════════════════════════
+#  РАЗДЕЛ 13 — БД: ВАКАНСИИ
+# ══════════════════════════════════════════════════════════════
+
+async def get_recruitment_settings() -> Optional[aiosqlite.Row]:
+    async with mdb() as db:
+        cur = await db.execute("SELECT * FROM recruitment_settings WHERE id=1")
+        return await cur.fetchone()
+
+
+async def update_recruitment_settings(**kwargs: Any) -> None:
+    if not kwargs:
+        return
+    async with mdb() as db:
+        for field, value in kwargs.items():
+            if field != "updated_by" and value is not None:
+                await db.execute(
+                    f"UPDATE recruitment_settings SET {field}=?, updated_by=?, updated_at=? WHERE id=1",
+                    (value, kwargs.get("updated_by", 0), _now_str()),
+                )
+        await db.commit()
+
+
+async def save_job_application(
+    applicant_id: int,
+    username: str,
+    age: int,
+    rating: int,
+    reason_why: str,
+    reason_motivation: str,
+) -> int:
+    async with mdb() as db:
+        cur = await db.execute(
+            "INSERT INTO job_applications "
+            "(applicant_id, username, age, communication_rating, reason_why, reason_motivation, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (applicant_id, username, age, rating, reason_why, reason_motivation, _now_str()),
+        )
+        await db.commit()
+        return cur.lastrowid
+
+
+async def get_pending_applications(limit: int = 20) -> List[aiosqlite.Row]:
+    async with mdb() as db:
+        cur = await db.execute(
+            "SELECT * FROM job_applications WHERE status='pending' ORDER BY id ASC LIMIT ?",
+            (limit,),
+        )
+        return await cur.fetchall()
+
+
+async def update_application_status(app_id: int, status: str) -> None:
+    async with mdb() as db:
+        await db.execute(
+            "UPDATE job_applications SET status=? WHERE id=?", (status, app_id)
+        )
+        await db.commit()
+
+
+async def get_staff_counts() -> Dict[str, int]:
+    counts: Dict[str, int] = {"moderator": 0, "reviewer": 0, "appeal_reviewer": 0}
+    async with mdb() as db:
+        cur = await db.execute("SELECT role, COUNT(*) as cnt FROM staff GROUP BY role")
+        for row in await cur.fetchall():
+            if row["role"] in ("moderator", "admin", "head_admin"):
+                counts["moderator"] += row["cnt"]
+            elif row["role"] == "reviewer":
+                counts["reviewer"] += row["cnt"]
+    counts["appeal_reviewer"] = counts["reviewer"]
+    return counts
+
+# ══════════════════════════════════════════════════════════════
+#  РАЗДЕЛ 14 — БД: ДИЗАЙН
+# ══════════════════════════════════════════════════════════════
+
+async def get_banner(name: str) -> Optional[str]:
+    try:
+        async with ddb() as db:
+            cur = await db.execute(
+                "SELECT file_id FROM banners WHERE name=?", (name,)
+            )
+            row = await cur.fetchone()
+        return row["file_id"] if row else None
+    except Exception:
+        return None
+
+
+async def get_text(name: str) -> str:
+    try:
+        async with ddb() as db:
+            cur = await db.execute(
+                "SELECT content FROM texts WHERE name=?", (name,)
+            )
+            row = await cur.fetchone()
+        return row["content"] if row else DEFAULT_TEXTS.get(name, "")
+    except Exception:
+        return DEFAULT_TEXTS.get(name, "")
+
+# ══════════════════════════════════════════════════════════════
+#  РАЗДЕЛ 15 — ПОДПИСКА / ВЕРИФИКАЦИЯ
+# ══════════════════════════════════════════════════════════════
+
+async def check_unsubscribed(bot: Bot, user_id: int) -> List[dict]:
+    channels = await db_get_channels()
+    result   = []
+    for ch in channels:
+        try:
+            member = await bot.get_chat_member(ch["channel_id"], user_id)
+            if member.status in ("left", "kicked", "banned"):
+                result.append(dict(ch))
+        except Exception:
+            result.append(dict(ch))
+    return result
+
+
+async def subscription_gate(message: Message) -> bool:
+    if await get_role(message.from_user.id) is not None:
+        return True
+    unsubscribed = await check_unsubscribed(message.bot, message.from_user.id)
+    if not unsubscribed:
+        return True
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"📢 {ch['title']}", url=ch["channel_url"])]
+        for ch in unsubscribed
+    ] + [[InlineKeyboardButton(text="✅ Я подписался — проверить", callback_data="sub_check")]])
+    await message.answer(
+        f"{HEADER}\n{DIVIDER}\n\n👋 Для доступа подпишитесь на каналы:\n\n{DIVIDER}\n{FOOTER}",
+        parse_mode="Markdown",
+        reply_markup=kb,
+    )
+    return False
+
+
+async def start_verification(message: Message) -> None:
+    target_fruit = random.choice(VERIFICATION_FRUITS)
+    shuffled     = VERIFICATION_FRUITS.copy()
+    random.shuffle(shuffled)
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(
+                text=f, callback_data=f"verify:{target_fruit}:{f}"
+            )
+            for f in shuffled[:2]
+        ],
+        [
+            InlineKeyboardButton(
+                text=f, callback_data=f"verify:{target_fruit}:{f}"
+            )
+            for f in shuffled[2:]
+        ],
+    ])
+    await message.answer(
+        "🍇🍍🥭🍎\n\n"
+        "*Вы новый пользователь бота!*\n"
+        "Чтобы воспользоваться функционалом, пройдите проверку аккаунта.\n\n"
+        "*Примечание:* это защита от DDoS-атак ботами.\n"
+        "Спасибо за понимание! 🙏\n\n"
+        f"*Выберите:* {target_fruit}",
+        parse_mode="Markdown",
+        reply_markup=kb,
+    )
+
+# ══════════════════════════════════════════════════════════════
+#  РАЗДЕЛ 16 — ОТПРАВКА С БАННЕРОМ
+# ══════════════════════════════════════════════════════════════
+
+async def send_with_banner(
+    message: Message, banner_name: str, text: str, **kwargs: Any
+) -> Message:
+    file_id = await get_banner(banner_name)
+    if file_id:
+        try:
+            return await message.answer_animation(
+                animation=file_id, caption=text, parse_mode="Markdown", **kwargs
+            )
+        except Exception:
+            pass
+    return await message.answer(text, parse_mode="Markdown", **kwargs)
+
+# ══════════════════════════════════════════════════════════════
+#  РАЗДЕЛ 17 — FSM СОСТОЯНИЯ
+# ══════════════════════════════════════════════════════════════
+
+class CheckState(StatesGroup):
+    waiting = State()
+
+class ReportState(StatesGroup):
+    target      = State()
+    report_type = State()
+    description = State()
+    evidence    = State()
+
+class ConsState(StatesGroup):
+    collecting = State()
+
+class AppealState(StatesGroup):
+    target   = State()
+    reason   = State()
+    evidence = State()
+
+class AdminAddState(StatesGroup):
+    target   = State()
+    status   = State()
+    reason   = State()
+    evidence = State()
+
+class AdminDeleteState(StatesGroup):
+    target = State()
+
+class StaffAddState(StatesGroup):
+    target = State()
+    role   = State()
+
+class StaffDeleteState(StatesGroup):
+    target = State()
+
+class ChannelAddState(StatesGroup):
+    channel_id = State()
+    url        = State()
+    title      = State()
+
+class ChannelDeleteState(StatesGroup):
+    channel_id = State()
+
+class BroadcastState(StatesGroup):
+    text = State()
+
+class JobApplicationState(StatesGroup):
+    age               = State()
+    rating            = State()
+    reason_why        = State()
+    reason_motivation = State()
+
+# ══════════════════════════════════════════════════════════════
+#  РАЗДЕЛ 18 — ФИЛЬТРЫ
+# ══════════════════════════════════════════════════════════════
+
+class IsStaffFilter(BaseFilter):
+    async def __call__(self, event: Any) -> bool:
+        user = getattr(event, "from_user", None)
+        return bool(user) and await get_role(user.id) is not None
+
+
+class IsHeadAdminFilter(BaseFilter):
+    async def __call__(self, event: Any) -> bool:
+        user = getattr(event, "from_user", None)
+        return bool(user) and await get_role(user.id) == "head_admin"
+
+# ══════════════════════════════════════════════════════════════
+#  РАЗДЕЛ 19 — КЛАВИАТУРЫ
+# ══════════════════════════════════════════════════════════════
+
+def user_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="🔎 ПРОВЕРИТЬ"),     KeyboardButton(text="📜 ИСТОРИЯ")],
+            [KeyboardButton(text="🚨 ПОЖАЛОВАТЬСЯ"),  KeyboardButton(text="⚖️ АПЕЛЛЯЦИЯ")],
+            [KeyboardButton(text="💼 СОТРУДНИКИ+"),    KeyboardButton(text="📱 MINI APP")],
+        ],
+        resize_keyboard=True,
+        input_field_placeholder="Введите @username или ID...",
+    )
+
+
+def admin_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="🔎 ПРОВЕРИТЬ"),   KeyboardButton(text="📜 ИСТОРИЯ")],
+            [KeyboardButton(text="📈 СТАТИСТИКА"),   KeyboardButton(text="🗑 СБРОС")],
+            [KeyboardButton(text="📱 MINI APP", web_app=WebAppInfo(url=MINI_APP_URL))],
+        ],
+        resize_keyboard=True,
+        input_field_placeholder="Выберите операцию...",
+    )
+
+
+def other_bases_keyboard(identifier: str) -> InlineKeyboardMarkup:
+    items = list(OTHER_BOTS.items())
+    rows  = []
+    for i in range(0, len(items), 2):
+        rows.append([
+            InlineKeyboardButton(
+                text=f"🔍 {name}",
+                url=f"https://t.me/{username}?start=check_{identifier}",
+            )
+            for name, username in items[i : i + 2]
+        ])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def report_types_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="🔥 СКАМ",       callback_data="rt:scam"),
+            InlineKeyboardButton(text="⚡ ПОДОЗРИТ.",  callback_data="rt:suspicious"),
+        ],
+        [
+            InlineKeyboardButton(text="💸 НЕВОЗВРАТ",  callback_data="rt:money"),
+            InlineKeyboardButton(text="🤖 ФЕЙК",       callback_data="rt:fake"),
+        ],
+        [InlineKeyboardButton(text="❌ ОТМЕНА",        callback_data="report:cancel")],
+    ])
+
+
+def reset_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="📛 ЖАЛОБЫ",  callback_data="reset:reports"),
+            InlineKeyboardButton(text="👥 БАЗУ",     callback_data="reset:users"),
+        ],
+        [
+            InlineKeyboardButton(text="📜 ИСТОРИЮ",  callback_data="reset:history"),
+            InlineKeyboardButton(text="🗄 ВСЁ",      callback_data="reset:all"),
+        ],
+        [InlineKeyboardButton(text="❌ ОТМЕНА",      callback_data="reset:cancel")],
+    ])
+
+
+def statuses_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="🔥 Скамер",     callback_data="adm_s:scammer"),
+            InlineKeyboardButton(text="💎 Гарант",     callback_data="adm_s:guarantor"),
+            InlineKeyboardButton(text="🫧 Доверенный", callback_data="adm_s:trusted"),
+        ],
+        [InlineKeyboardButton(text="❌ Отмена",        callback_data="adm_s:cancel")],
+    ])
+
+
+def pending_keyboard(report_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="✅ Принять",   callback_data=f"pnd:approve:{report_id}"),
+            InlineKeyboardButton(text="❌ Отклонить", callback_data=f"pnd:reject:{report_id}"),
+        ],
+        [InlineKeyboardButton(text="⏩ Следующая",    callback_data=f"pnd:next:{report_id}")],
+    ])
+
+
+def cons_reviewer_keyboard(cons_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="✅ Принять",           callback_data=f"cons:ok:{cons_id}"),
+            InlineKeyboardButton(text="❌ Отклонить",         callback_data=f"cons:no:{cons_id}"),
+        ],
+        [InlineKeyboardButton(text="🔄 Переписать заново", callback_data=f"cons:redo:{cons_id}")],
+    ])
+
+
+def cons_mod_keyboard(cons_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="✅ Принять в базу", callback_data=f"modcons:approve:{cons_id}"),
+            InlineKeyboardButton(text="❌ Отклонить",      callback_data=f"modcons:reject:{cons_id}"),
+        ],
+    ])
+
+
+def cons_user_keyboard(cons_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="📄 Моя жалоба",     callback_data=f"cshow:{cons_id}"),
+            InlineKeyboardButton(text="✏️ Написать заново", callback_data=f"cnew:{cons_id}"),
+        ],
+    ])
+
+
+def staff_roles_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="🛡️ Администратор", callback_data="sr:admin"),
+            InlineKeyboardButton(text="💎 Гарант",         callback_data="sr:guarantor"),
+        ],
+        [
+            InlineKeyboardButton(text="🔍 Рассмотритель",  callback_data="sr:reviewer"),
+            InlineKeyboardButton(text="🔨 Модератор",      callback_data="sr:moderator"),
+        ],
+        [InlineKeyboardButton(text="❌ Отмена",            callback_data="sr:cancel")],
+    ])
+
+
+def channels_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="➕ Добавить", callback_data="chan:add"),
+            InlineKeyboardButton(text="🗑 Удалить",  callback_data="chan:del"),
+        ],
+        [
+            InlineKeyboardButton(text="📋 Список",   callback_data="chan:list"),
+            InlineKeyboardButton(text="❌ Закрыть",  callback_data="chan:close"),
+        ],
+    ])
+
+
+def cancel_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔙 ОТМЕНА", callback_data="cancel_action")]
+    ])
+
+
+def appeal_reviewer_keyboard(appeal_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="✅ Одобрить",   callback_data=f"aprev:ok:{appeal_id}"),
+            InlineKeyboardButton(text="❌ Отклонить",  callback_data=f"aprev:no:{appeal_id}"),
+        ],
+        [InlineKeyboardButton(text="⏩ Следующая",     callback_data=f"aprev:next:{appeal_id}")],
+    ])
+
+
+def appeal_mod_keyboard(appeal_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="✅ Удалить из базы",  callback_data=f"apmod:approve:{appeal_id}"),
+            InlineKeyboardButton(text="❌ Оставить в базе", callback_data=f"apmod:reject:{appeal_id}"),
+        ],
+    ])
+
+# ══════════════════════════════════════════════════════════════
+#  РАЗДЕЛ 20 — HTTP API
+# ══════════════════════════════════════════════════════════════
+
+def _require_auth(handler):
+    @wraps(handler)
+    async def wrapper(request: web.Request):
+        if request.headers.get("Authorization", "") != f"Bearer {API_SECRET}":
+            return web.json_response({"error": "Unauthorized"}, status=401)
+        return await handler(request)
+    return wrapper
+
+
+@_require_auth
+async def api_get_stats(request: web.Request) -> web.Response:
+    stats        = await get_all_stats()
+    total_users  = await db_count("users")
+    return web.json_response({
+        "total_users":      total_users,
+        "scammers":         await db_count("users", "status='scammer'"),
+        "guarantors":       await db_count("users", "status='guarantor'"),
+        "trusted":          await db_count("users", "status='trusted'"),
+        "pending_reports":  await db_count("reports", "status='pending'"),
+        "pending_cons":     await db_count("cons_reports", "status='pending_review'"),
+        "pending_appeals":  await db_count("appeals", "status='pending'"),
+        "waiting_appeals":  await db_count("appeals", "status='reviewer_approved'"),
+        **stats,
+    })
+
+
+@_require_auth
+async def api_get_recruitment_settings(request: web.Request) -> web.Response:
+    s = await get_recruitment_settings()
+    if not s:
+        return web.json_response({"is_open": True, "needed_moderators": 3, "needed_reviewers": 3, "needed_appeal_reviewers": 2})
+    return web.json_response({
+        "is_open":                 s["is_open"],
+        "needed_moderators":       s["needed_moderators"],
+        "needed_reviewers":        s["needed_reviewers"],
+        "needed_appeal_reviewers": s["needed_appeal_reviewers"],
+    })
+
+
+@_require_auth
+async def api_update_recruitment(request: web.Request) -> web.Response:
+    try:
+        data = await request.json()
+        await update_recruitment_settings(
+            is_open                 = data.get("is_open"),
+            needed_moderators       = data.get("needed_moderators"),
+            needed_reviewers        = data.get("needed_reviewers"),
+            needed_appeal_reviewers = data.get("needed_appeal_reviewers"),
+            updated_by              = int(data.get("updated_by", 0)),
+        )
+        return web.json_response({"status": "ok"})
+    except Exception as exc:
+        return web.json_response({"error": str(exc)}, status=500)
+
+
+@_require_auth
+async def api_get_staff_counts(request: web.Request) -> web.Response:
+    return web.json_response(await get_staff_counts())
+
+
+@_require_auth
+async def api_get_pending_applications(request: web.Request) -> web.Response:
+    apps = await get_pending_applications(20)
+    return web.json_response([dict(a) for a in apps])
+
+
+@_require_auth
+async def api_review_application(request: web.Request) -> web.Response:
+    try:
+        data   = await request.json()
+        app_id = data.get("app_id")
+        status = data.get("status")
+        if not app_id or status not in ("approved", "rejected"):
+            return web.json_response({"error": "Invalid data"}, status=400)
+        await update_application_status(app_id, status)
+        return web.json_response({"status": "ok"})
+    except Exception as exc:
+        return web.json_response({"error": str(exc)}, status=500)
+
+
+@_require_auth
+async def api_get_top_moderators(request: web.Request) -> web.Response:
+    top = await get_top_moderators(50)
+    return web.json_response([
+        {"telegram_id": r["telegram_id"], "rank": r["rank"], "total_actions": r["total_actions"]}
+        for r in top
+    ])
+
+
+@_require_auth
+async def api_get_pending_cons(request: web.Request) -> web.Response:
+    pending = await db_pending_cons(20)
+    return web.json_response([
+        {
+            "id":          r["id"],
+            "reporter_id": r["reporter_id"],
+            "message_text": r["message_text"][:500],
+            "has_media":   bool(r["media_file_id"]),
+            "created_at":  r["created_at"],
+        }
+        for r in pending
+    ])
+
+
+@_require_auth
+async def api_get_cons_detail(request: web.Request) -> web.Response:
+    cons_id = int(request.match_info.get("cons_id", 0))
+    row     = await db_get_cons(cons_id)
+    if not row:
+        return web.json_response({"error": "Not found"}, status=404)
+    return web.json_response(dict(row))
+
+
+@_require_auth
+async def api_moderate_cons(request: web.Request) -> web.Response:
+    try:
+        data         = await request.json()
+        cons_id      = data.get("cons_id")
+        action       = data.get("action")
+        moderator_id = data.get("moderator_id")
+        if not cons_id or action not in ("approve", "reject"):
+            return web.json_response({"error": "Invalid data"}, status=400)
+        row = await db_get_cons(cons_id)
+        if not row:
+            return web.json_response({"error": "Not found"}, status=404)
+        if action == "approve":
+            match  = re.search(r"(@\w+|\d{5,15})", row["message_text"])
+            target = match.group(1) if match else f"cons_{cons_id}"
+            await db_add_user(target, None, "scammer",
+                              f"Жалоба #{cons_id}: {row['message_text'][:200]}",
+                              None, str(moderator_id))
+            await db_update_cons_status(cons_id, "moderated_approved")
+        else:
+            await db_update_cons_status(cons_id, "moderated_rejected")
+        await update_mod_rank(moderator_id, 1)
+        return web.json_response({"status": "ok"})
+    except Exception as exc:
+        return web.json_response({"error": str(exc)}, status=500)
+
+
+@_require_auth
+async def api_search_db(request: web.Request) -> web.Response:
+    query = request.rel_url.query.get("q", "").strip().lstrip("@").lower()
+    if not query:
+        return web.json_response({"error": "No query"}, status=400)
+    try:
+        async with mdb() as db:
+            cur = await db.execute(
+                "SELECT * FROM users WHERE LOWER(telegram_id) LIKE ? OR LOWER(username) LIKE ? LIMIT 20",
+                (f"%{query}%", f"%{query}%"),
+            )
+            rows = await cur.fetchall()
+        return web.json_response([dict(r) for r in rows])
+    except Exception as exc:
+        return web.json_response({"error": str(exc)}, status=500)
+
+
+@_require_auth
+async def api_get_pending_appeals(request: web.Request) -> web.Response:
+    stage   = request.rel_url.query.get("stage", "pending")
+    appeals = await db_pending_appeals(stage, 20)
+    return web.json_response([dict(r) for r in appeals])
+
+
+@_require_auth
+async def api_get_design(request: web.Request) -> web.Response:
+    async with ddb() as db:
+        cur     = await db.execute("SELECT name, file_id, file_type FROM banners")
+        banners = {r["name"]: {"file_id": r["file_id"], "file_type": r["file_type"]} for r in await cur.fetchall()}
+        cur     = await db.execute("SELECT name, content FROM texts")
+        texts   = {r["name"]: r["content"] for r in await cur.fetchall()}
+    return web.json_response({"banners": banners, "texts": texts})
+
+
+@_require_auth
+async def api_update_banner(request: web.Request) -> web.Response:
+    try:
+        data = await request.json()
+        async with ddb() as db:
+            await db.execute(
+                "INSERT OR REPLACE INTO banners (name, file_id, file_type, updated_at) VALUES (?, ?, ?, ?)",
+                (data.get("name"), data.get("file_id"), data.get("file_type", "gif"), _now_str()),
+            )
+            await db.commit()
+        return web.json_response({"status": "ok"})
+    except Exception as exc:
+        return web.json_response({"error": str(exc)}, status=500)
+
+
+@_require_auth
+async def api_update_text(request: web.Request) -> web.Response:
+    try:
+        data    = await request.json()
+        name    = data.get("name")
+        content = (data.get("content") or "").strip()
+        async with ddb() as db:
+            if content:
+                await db.execute(
+                    "INSERT OR REPLACE INTO texts (name, content, updated_at) VALUES (?, ?, ?)",
+                    (name, content, _now_str()),
+                )
+            else:
+                await db.execute("DELETE FROM texts WHERE name=?", (name,))
+            await db.commit()
+        return web.json_response({"status": "ok"})
+    except Exception as exc:
+        return web.json_response({"error": str(exc)}, status=500)
+
+
+async def start_api_server() -> None:
+    app = web.Application()
+    app.router.add_get("/api/stats",                  api_get_stats)
+    app.router.add_get("/api/moderators/top",         api_get_top_moderators)
+    app.router.add_get("/api/cons/pending",           api_get_pending_cons)
+    app.router.add_get("/api/cons/{cons_id}",         api_get_cons_detail)
+    app.router.add_post("/api/cons/moderate",         api_moderate_cons)
+    app.router.add_get("/api/search",                 api_search_db)
+    app.router.add_get("/api/appeals/pending",        api_get_pending_appeals)
+    app.router.add_get("/api/design",                 api_get_design)
+    app.router.add_post("/api/design/banner",         api_update_banner)
+    app.router.add_post("/api/design/text",           api_update_text)
+    app.router.add_get("/api/recruitment/settings",   api_get_recruitment_settings)
+    app.router.add_post("/api/recruitment/update",    api_update_recruitment)
+    app.router.add_get("/api/staff/counts",           api_get_staff_counts)
+    app.router.add_get("/api/applications/pending",   api_get_pending_applications)
+    app.router.add_post("/api/applications/review",   api_review_application)
+
+    runner = web.AppRunner(app)
+    await runner.setup()
+    await web.TCPSite(runner, "0.0.0.0", API_PORT).start()
+    log.info("✅ HTTP API запущен на порту %s", API_PORT)
+
+# ══════════════════════════════════════════════════════════════
+#  РАЗДЕЛ 21 — РОУТЕР И ХЭНДЛЕРЫ: СТАРТ / ВЕРИФИКАЦИЯ
+# ══════════════════════════════════════════════════════════════
+
+router = Router()
+
+
+@router.message(CommandStart())
+async def cmd_start(message: Message, state: FSMContext) -> None:
+    fsm_cancel(message.from_user.id)
+    await state.clear()
+    await db_register_user(message.from_user)
+
+    if not await is_user_verified(message.from_user.id):
+        await start_verification(message)
+        return
+
+    if not await subscription_gate(message):
+        return
+
+    role = await get_role(message.from_user.id)
+    text = await get_text("welcome_admin" if role else "welcome_user")
+    kb   = admin_keyboard() if role else user_keyboard()
+    await send_with_banner(message, "start", text, reply_markup=kb)
+
+
+@router.message(Command("whoami"))
+async def cmd_whoami(message: Message) -> None:
+    """Диагностическая команда — показывает ID и роль пользователя."""
+    my_id = message.from_user.id
+    role  = await get_role(my_id)
+    role_label = ROLE_LABELS.get(role, "обычный пользователь") if role else "обычный пользователь"
+    match = (my_id == MAIN_ADMIN_ID)
+    await message.answer(
+        f"{HEADER}\n{DIVIDER}\n\n"
+        f"🆔 *Ваш Telegram ID:* `{my_id}` (тип: `{type(my_id).__name__}`)\n"
+        f"🔑 *MAIN_ADMIN_ID в конфиге:* `{MAIN_ADMIN_ID}` (тип: `{type(MAIN_ADMIN_ID).__name__}`)\n"
+        f"🔍 *Совпадают:* `{match}`\n"
+        f"👤 *Роль:* {role_label}\n\n"
+        f"{'✅ Вы Главный Администратор' if role == 'head_admin' else '❌ Вы НЕ Главный Администратор — раскомментируй хардкод в начале файла!'}\n\n"
+        f"{DIVIDER}\n{FOOTER}",
+        parse_mode="Markdown",
+    )
+
+
+@router.callback_query(F.data.startswith("verify:"))
+async def verify_callback(callback: CallbackQuery) -> None:
+    _, target, chosen = callback.data.split(":")
+    if target == chosen:
+        await mark_verified(callback.from_user.id)
+        await callback.message.delete()
+        await callback.message.answer(
+            "✅ *Отлично, вы прошли проверку!*\n\n"
+            "Вам доступен функционал пользователя.\n"
+            "Удачного пользования ❤️",
+            parse_mode="Markdown",
+        )
+        role = await get_role(callback.from_user.id)
+        text = await get_text("welcome_admin" if role else "welcome_user")
+        kb   = admin_keyboard() if role else user_keyboard()
+        await callback.message.answer(text, parse_mode="Markdown", reply_markup=kb)
+        await callback.answer("✅ Доступ открыт!")
+    else:
+        await callback.answer("❌ Неправильный фрукт! Попробуйте ещё раз.", show_alert=True)
+
+
+@router.callback_query(F.data == "sub_check")
+async def sub_check_callback(callback: CallbackQuery) -> None:
+    if await check_unsubscribed(callback.message.bot, callback.from_user.id):
+        await callback.answer("❌ Вы ещё не подписались на все каналы!", show_alert=True)
+        return
+    await callback.message.delete()
+    role = await get_role(callback.from_user.id)
+    text = await get_text("welcome_admin" if role else "welcome_user")
+    kb   = admin_keyboard() if role else user_keyboard()
+    await callback.message.answer(text, parse_mode="Markdown", reply_markup=kb)
+    await callback.answer("✅ Добро пожаловать!")
+
+
+@router.callback_query(F.data == "cancel_action")
+async def cancel_action(callback: CallbackQuery, state: FSMContext) -> None:
+    fsm_cancel(callback.from_user.id)
+    await state.clear()
+    await callback.answer("🚫 Действие отменено")
+    try:
+        await callback.message.delete()
+    except Exception:
+        pass
+    role = await get_role(callback.from_user.id)
+    text = await get_text("welcome_admin" if role else "welcome_user")
+    kb   = admin_keyboard() if role else user_keyboard()
+    await callback.message.answer(text, parse_mode="Markdown", reply_markup=kb)
+
+# ══════════════════════════════════════════════════════════════
+#  РАЗДЕЛ 22 — ПРОВЕРКА
+# ══════════════════════════════════════════════════════════════
+
+@router.message(Command("check"))
+async def cmd_check(message: Message, state: FSMContext) -> None:
+    await state.clear()
+    if not await subscription_gate(message):
+        return
+    if not await rate_ok(message.from_user.id):
+        await message.answer(f"⚡ Подождите {RATE_LIMIT_SECONDS} сек.")
+        return
+    parts = message.text.split(maxsplit=1)
+    if len(parts) < 2:
+        await message.answer(
+            "❓ Формат: `/check @username` или `/check 123456`",
+            parse_mode="Markdown",
+        )
+        return
+    identifier = validate_identifier(parts[1])
+    if not identifier:
+        await message.answer("❌ Неверный формат!")
+        return
+    asyncio.create_task(run_check(message, identifier))
+
+
+@router.message(Command("check_list"))
+async def cmd_check_list(message: Message) -> None:
+    """Массовая проверка: /check_list user1, user2, user3"""
+    if not await subscription_gate(message):
+        return
+    if not await rate_ok(message.from_user.id):
+        await message.answer(f"⚡ Подождите {RATE_LIMIT_SECONDS} сек.")
+        return
+    parts = message.text.split(maxsplit=1)
+    if len(parts) < 2:
+        await message.answer(
+            "❓ Формат: `/check_list user1, user2, user3`",
+            parse_mode="Markdown",
+        )
+        return
+    raw_list = [x.strip().lstrip("@") for x in parts[1].replace(",", " ").split() if x.strip()]
+    identifiers = [validate_identifier(x) for x in raw_list]
+    identifiers = [x for x in identifiers if x]
+    if not identifiers:
+        await message.answer("❌ Не найдено корректных идентификаторов!")
+        return
+    if len(identifiers) > 10:
+        await message.answer("⚠️ Максимум 10 за раз!")
+        identifiers = identifiers[:10]
+
+    status_msg = await message.answer(
+        f"{HEADER}\n{DIVIDER}\n\n🔎 *МАССОВАЯ ПРОВЕРКА*\n\n⏳ Проверяю {len(identifiers)} записей...\n\n{FOOTER}",
+        parse_mode="Markdown",
+    )
+
+    lines: List[str] = []
+    for ident in identifiers:
+        await inc_stat("checks")
+        staff_role: Optional[str] = None
+        if ident.isdigit():
+            staff_role = await get_role(int(ident))
+        user_row = await db_get_user(ident)
+
+        if staff_role:
+            role_label = ROLE_LABELS.get(staff_role, staff_role)
+            lines.append(f"🛡️ `{ident}` — *{role_label}* (сотрудник)")
+            await db_add_history(str(message.from_user.id), ident, "clean")
+        elif user_row:
+            await inc_stat("found")
+            st    = user_row["status"]
+            emoji = STATUS_EMOJI.get(st, "🔥")
+            lines.append(f"{emoji} `{ident}` — *{st.upper()}* | {sanitize(user_row['reason'])[:60]}")
+            await db_add_history(str(message.from_user.id), ident, "found")
+        else:
+            await inc_stat("clean")
+            lines.append(f"🫧 `{ident}` — *ЧИСТ*")
+            await db_add_history(str(message.from_user.id), ident, "clean")
+
+    result = f"{HEADER}\n{DIVIDER}\n\n🔎 *Результат проверки ({len(identifiers)})*\n\n"
+    result += "\n".join(lines)
+    result += (
+        f"\n\n{LINE}\n"
+        f"📋 *Примечание:*\n"
+        f"Отсутствие в базе не гарантирует безопасность. "
+        f"Проводите сделки через официальных гарантов ARION и проверяйте пользователей в других базах.\n"
+        f"{LINE}\n\n"
+        f"{DIVIDER}\n{FOOTER}"
+    )
+    try:
+        await status_msg.edit_text(result, parse_mode="Markdown")
+    except Exception:
+        await message.answer(result, parse_mode="Markdown")
+    log.info("check_list %s by %d", identifiers, message.from_user.id)
+
+
+@router.message(F.text == "🔎 ПРОВЕРИТЬ")
+async def button_check(message: Message, state: FSMContext) -> None:
+    fsm_cancel(message.from_user.id)
+    await state.clear()
+    if not await subscription_gate(message):
+        return
+    if not await rate_ok(message.from_user.id):
+        await message.answer(f"⚡ Подождите {RATE_LIMIT_SECONDS} сек.")
+        return
+    await message.answer("🔎 Введите @username или ID для проверки:")
+    await state.set_state(CheckState.waiting)
+    fsm_schedule(message.from_user.id, state)
+
+
+@router.message(CheckState.waiting)
+async def check_input(message: Message, state: FSMContext) -> None:
+    fsm_cancel(message.from_user.id)
+    identifier = validate_identifier(message.text or "")
+    if not identifier:
+        await message.answer("❌ Неверный формат! Пример: @username или 123456789")
+        fsm_schedule(message.from_user.id, state)
+        return
+    await state.clear()
+    asyncio.create_task(run_check(message, identifier))
+
+
+async def run_check(message: Message, identifier: str) -> None:
+    try:
+        await inc_stat("checks")
+        loading_base = await get_text("check_start")
+        loading_text = loading_base + f"🎯 Цель: `{identifier}`\n\n{progress_bar(0)}"
+        status_msg   = await message.answer(loading_text, parse_mode="Markdown")
+
+        for pct in (25, 50, 75, 100):
+            await asyncio.sleep(0.3)
+            try:
+                await status_msg.edit_text(
+                    loading_base + f"🎯 Цель: `{identifier}`\n\n{progress_bar(pct)}",
+                    parse_mode="Markdown",
+                )
+            except Exception:
+                pass
+
+        # Проверяем роль сотрудника
+        staff_role: Optional[str] = None
+        if identifier.isdigit():
+            staff_role = await get_role(int(identifier))
+        else:
+            async with mdb() as db:
+                cur = await db.execute(
+                    "SELECT telegram_id, role FROM staff WHERE LOWER(username)=?",
+                    (identifier.lower(),),
+                )
+                row = await cur.fetchone()
+            if row:
+                staff_role = row["role"]
+
+        user_row = await db_get_user(identifier)
+
+        if staff_role:
+            await inc_stat("clean")
+            role_label  = ROLE_LABELS.get(staff_role, staff_role)
+            result_text = (
+                f"{HEADER}\n{DIVIDER}\n\n"
+                f"✅ *Проверка завершена*\n\n"
+                f"🆔 `{identifier}`\n\n"
+                f"{LINE}\n"
+            )
+            if staff_role == "head_admin":
+                result_text += (
+                    f"👑 *{role_label}*\n\n"
+                    f"📌 Данный пользователь является *создателем и владельцем* базы ARION SCAM BASE.\n"
+                    f"Он несёт полную ответственность за работу системы и принимает окончательные решения по всем вопросам.\n"
+                    f"Именно он формирует политику базы, управляет составом сотрудников и обеспечивает её актуальность.\n\n"
+                    f"🔒 Верифицирован системой *ARION* как Главный Администратор\n"
+                )
+            elif staff_role == "admin":
+                result_text += (
+                    f"🛡️ *{role_label}*\n\n"
+                    f"📌 Данный пользователь является *штатным сотрудником* проекта ARION.\n"
+                    f"Администраторы — неотъемлемая часть команды: они обеспечивают работу базы, "
+                    f"обрабатывают жалобы и поддерживают порядок в системе.\n\n"
+                    f"🔒 Верифицирован системой *ARION* как Администратор\n"
+                )
+            elif staff_role == "guarantor":
+                result_text += (
+                    f"💎 *{role_label}*\n\n"
+                    f"📌 Данный пользователь *верифицирован* системой ARION как официальный гарант.\n"
+                    f"Через него можно безопасно проводить сделки в пределах установленного лимита.\n"
+                    f"Гарант несёт финансовую и репутационную ответственность за каждую проводимую сделку.\n\n"
+                    f"✅ Статус: *ВЕРИФИЦИРОВАН*\n"
+                    f"💰 Сделки через данного гаранта разрешены\n"
+                )
+            elif staff_role in ("moderator", "reviewer"):
+                result_text += (
+                    f"⚖️ *{role_label}*\n\n"
+                    f"📌 Данный пользователь является *штатным сотрудником* проекта ARION.\n"
+                    f"{'Арбитры' if staff_role == 'moderator' else 'Валидаторы'} — неотъемлемая часть команды: "
+                    f"они рассматривают {'апелляции и выносят окончательные решения' if staff_role == 'moderator' else 'жалобы и обеспечивают их корректную обработку'}, "
+                    f"обеспечивая справедливость и актуальность базы данных.\n\n"
+                    f"🔒 Верифицирован системой *ARION*\n"
+                )
+                if identifier.isdigit():
+                    rank, total_actions, _ = await get_mod_rank(int(identifier))
+                    emoji = RANK_EMOJI.get(rank, "🏅")
+                    result_text += f"\n🏅 *Ранг:* {emoji} {rank} (обработано: {total_actions})"
+            else:
+                result_text += (
+                    f"🛡️ *{role_label}*\n\n"
+                    f"🔒 Верифицирован системой *ARION*\n"
+                )
+            result_text += f"\n\n{DIVIDER}\n{FOOTER}"
+            await db_add_history(str(message.from_user.id), identifier, "clean")
+
+        elif user_row:
+            await inc_stat("found")
+            status = user_row["status"]
+            emoji  = STATUS_EMOJI.get(status, "🔥")
+            tag    = f"@{user_row['username']}" if user_row["username"] else f"ID: {user_row['telegram_id']}"
+            base   = await get_text("scammer_found")
+            result_text = (
+                f"{base}"
+                f"🆔 {sanitize(tag)} | `{user_row['telegram_id']}`\n\n"
+                f"{LINE}\n📋 *ДОСЬЕ:*\n«{sanitize(user_row['reason'])}»\n\n"
+            )
+            if user_row["evidence"]:
+                result_text += f"🔗 Улики: {sanitize(user_row['evidence'])}\n"
+            result_text += (
+                f"📅 Внесён: {user_row['added_at']}\n{LINE}\n\n"
+                f"⚡ *ВЕРДИКТ: НЕ СВЯЗЫВАТЬСЯ*\n"
+                f"🚫 Все операции с данным лицом запрещены!\n\n"
+                f"⚖️ Если это ошибка — используйте /appeal для подачи апелляции.\n\n"
+                f"{DIVIDER}\n{FOOTER}"
+            )
+            await db_add_history(str(message.from_user.id), identifier, "found")
+
+        else:
+            await inc_stat("clean")
+            base        = await get_text("user_clean")
+            result_text = (
+                f"{base}\n\n"
+                f"🆔 `{identifier}`\n\n"
+                f"{LINE}\n"
+                f"📋 *Примечание для ознакомления:*\n\n"
+                f"⚠️ Отсутствие записи в базе ARION *не является* гарантией безопасности.\n"
+                f"Данный пользователь может не числиться мошенником сейчас, однако это не исключает возможность мошеннических действий с его стороны.\n\n"
+                f"💡 *Рекомендации:*\n"
+                f"• Проводите сделки только через официальных гарантов базы ARION\n"
+                f"• Дополнительно проверьте информацию о пользователе в других базах данных\n"
+                f"• Сохраняйте скриншоты всей переписки до завершения сделки\n"
+                f"{LINE}\n\n"
+                f"{DIVIDER}\n{FOOTER}"
+            )
+            await db_add_history(str(message.from_user.id), identifier, "clean")
+
+        result_text += f"\n\n{DIVIDER}\n🔎 *ПРОВЕРИТЬ В ДРУГИХ БАЗАХ:*"
+        await status_msg.edit_text(
+            result_text,
+            parse_mode="Markdown",
+            reply_markup=other_bases_keyboard(identifier),
+        )
+        log.info("check %s by %d", identifier, message.from_user.id)
+
+    except Exception as exc:
+        log.error("run_check: %s", exc)
+        await message.answer("❌ Ошибка проверки. Попробуйте позже.")
+
+# ══════════════════════════════════════════════════════════════
+#  РАЗДЕЛ 23 — ЖАЛОБЫ (быстрая форма)
+# ══════════════════════════════════════════════════════════════
+
+@router.message(Command("report"))
+@router.message(F.text == "🚨 ПОЖАЛОВАТЬСЯ")
+async def start_report(message: Message, state: FSMContext) -> None:
+    await state.clear()
+    if not await subscription_gate(message):
+        return
+    if await get_role(message.from_user.id):
+        await message.answer(
+            f"{HEADER}\n{DIVIDER}\n\n"
+            "⚠️ Сотрудники системы используют /addscam.\n\n"
+            f"{FOOTER}",
+            parse_mode="Markdown",
+        )
+        return
+    text = await get_text("report_start")
+    await message.answer(f"{text}\nВведите @username или ID нарушителя:", parse_mode="Markdown")
+    await state.set_state(ReportState.target)
+    fsm_schedule(message.from_user.id, state)
+
+
+@router.message(ReportState.target)
+async def report_target(message: Message, state: FSMContext) -> None:
+    fsm_cancel(message.from_user.id)
+    target = (message.text or "").strip().lstrip("@")
+    if not target:
+        await message.answer("❌ Введите ID или @username:")
+        fsm_schedule(message.from_user.id, state)
+        return
+    await state.update_data(target_id=target, target_un=message.text)
+    await message.answer(
+        f"{HEADER}\n{DIVIDER}\n\n📋 Выберите тип жалобы:",
+        parse_mode="Markdown",
+        reply_markup=report_types_keyboard(),
+    )
+    await state.set_state(ReportState.report_type)
+    fsm_schedule(message.from_user.id, state)
+
+
+@router.callback_query(F.data.startswith("rt:"))
+async def report_type_cb(callback: CallbackQuery, state: FSMContext) -> None:
+    fsm_cancel(callback.from_user.id)
+    type_map = {"scam": "СКАМ", "suspicious": "ПОДОЗРИТЕЛЬНО", "money": "НЕВОЗВРАТ", "fake": "ФЕЙК"}
+    rtype    = type_map.get(callback.data.split(":")[1], "ДРУГОЕ")
+    await state.update_data(report_type=rtype)
+    await callback.message.edit_text(
+        f"{HEADER}\n{DIVIDER}\n\n📝 *ОПИШИТЕ СИТУАЦИЮ*\n\n🏷 Тип: *{rtype}*\n\nМаксимум 500 символов:",
+        parse_mode="Markdown",
+    )
+    await state.set_state(ReportState.description)
+    fsm_schedule(callback.from_user.id, state)
+    await callback.answer()
+
+
+@router.message(ReportState.description)
+async def report_description(message: Message, state: FSMContext) -> None:
+    fsm_cancel(message.from_user.id)
+    desc = (message.text or "").strip()
+    if not desc or len(desc) > 500:
+        await message.answer("❌ От 1 до 500 символов!")
+        fsm_schedule(message.from_user.id, state)
+        return
+    await state.update_data(description=desc)
+    await message.answer(
+        f"{HEADER}\n{DIVIDER}\n\n🔗 *ДОКАЗАТЕЛЬСТВА*\n\nСсылка на скриншот/видео или «-» если нет:",
+        parse_mode="Markdown",
+    )
+    await state.set_state(ReportState.evidence)
+    fsm_schedule(message.from_user.id, state)
+
+
+@router.message(ReportState.evidence)
+async def report_evidence(message: Message, state: FSMContext) -> None:
+    fsm_cancel(message.from_user.id)
+    evidence = (message.text or "").strip()
+    data     = await state.get_data()
+    await state.clear()
+    report_id = await db_add_report(
+        str(message.from_user.id),
+        data.get("target_id", ""),
+        data.get("target_un", ""),
+        data.get("report_type", ""),
+        data.get("description", ""),
+        evidence if evidence != "-" else None,
+    )
+    if not report_id:
+        await message.answer("❌ Ошибка сохранения жалобы.")
+        return
+    await inc_stat("reports")
+    text  = await get_text("report_success")
+    text += f"\n\n📌 Номер жалобы: *#{report_id}*"
+    await message.answer(text, parse_mode="Markdown")
+
+
+@router.callback_query(F.data == "report:cancel")
+async def report_cancel(callback: CallbackQuery, state: FSMContext) -> None:
+    fsm_cancel(callback.from_user.id)
+    await state.clear()
+    await callback.message.edit_text("❌ Жалоба отменена.")
+    await callback.answer()
+
+# ══════════════════════════════════════════════════════════════
+#  РАЗДЕЛ 24 — /cons
+# ══════════════════════════════════════════════════════════════
+
+@router.message(Command("cons"))
+async def cmd_cons(message: Message, state: FSMContext) -> None:
+    if message.chat.type != "private" and message.chat.id != CONS_GROUP_CHAT_ID:
+        return
+    await state.clear()
+    if not await subscription_gate(message):
+        return
+    text = await get_text("cons_form")
+    await message.answer(text, parse_mode="Markdown")
+    await state.set_state(ConsState.collecting)
+    await state.update_data(draft="", media_id=None, media_type=None)
+    fsm_schedule(message.from_user.id, state)
+
+
+@router.message(ConsState.collecting, Command("Not"))
+async def cons_submit(message: Message, state: FSMContext) -> None:
+    fsm_cancel(message.from_user.id)
+    data  = await state.get_data()
+    await state.clear()
+    draft = (data.get("draft") or "").strip()
+    if not draft:
+        await message.answer(
+            f"{HEADER}\n{DIVIDER}\n\n❌ Текст жалобы пустой!\n\n{FOOTER}",
+            parse_mode="Markdown",
+        )
+        return
+    cons_id = await db_save_cons(
+        str(message.from_user.id), draft, data.get("media_id"), data.get("media_type")
+    )
+    if not cons_id:
+        await message.answer("❌ Ошибка сохранения.")
+        return
+    pending_count = await db_count("cons_reports", "status='pending_review'")
+    await message.answer(
+        f"{HEADER}\n{DIVIDER}\n\n✅ *ЖАЛОБА ОТПРАВЛЕНА НА РАССМОТРЕНИЕ!*\n\n"
+        f"📌 Номер: *#{cons_id}*\n\n🔍 Рассмотрители изучат жалобу.\n\n{DIVIDER}\n{FOOTER}",
+        parse_mode="Markdown",
+    )
+    header_text = (
+        f"{HEADER}\n{DIVIDER}\n\n📋 *{pending_count} жалоб в очереди*\n\n"
+        f"🆕 *ЖАЛОБА #{cons_id}*\n👤 От: `{message.from_user.id}`"
+        + (f" (@{message.from_user.username})" if message.from_user.username else "")
+        + f"\n📅 {_now_str()}\n\n{DIVIDER}\n\n📝 *ТЕКСТ:*\n\n{draft}\n\n{DIVIDER}"
+    )
+    kb    = cons_reviewer_keyboard(cons_id)
+    mid   = data.get("media_id")
+    mtype = data.get("media_type")
+    try:
+        if mid and mtype == "photo":
+            await message.bot.send_photo(
+                CONSIDERATION_CHAT_ID, photo=mid, caption=header_text,
+                parse_mode="Markdown", reply_markup=kb,
+            )
+        elif mid and mtype == "video":
+            await message.bot.send_video(
+                CONSIDERATION_CHAT_ID, video=mid, caption=header_text,
+                parse_mode="Markdown", reply_markup=kb,
+            )
+        else:
+            await message.bot.send_message(
+                CONSIDERATION_CHAT_ID, header_text, parse_mode="Markdown", reply_markup=kb
+            )
+    except Exception as exc:
+        log.error("cons send error: %s", exc)
+
+
+@router.message(ConsState.collecting)
+async def cons_collect(message: Message, state: FSMContext) -> None:
+    fsm_cancel(message.from_user.id)
+    data  = await state.get_data()
+    draft = data.get("draft", "")
+    if message.text:
+        draft = (draft + "\n" + message.text).strip()
+        await state.update_data(draft=draft)
+    if message.photo:
+        await state.update_data(media_id=message.photo[-1].file_id, media_type="photo")
+    elif message.video:
+        await state.update_data(media_id=message.video.file_id, media_type="video")
+    fsm_schedule(message.from_user.id, state)
+    await message.answer(
+        "✏️ Данные сохранены. Продолжайте или отправьте */Not* для подачи.",
+        parse_mode="Markdown",
+    )
+
+# ══════════════════════════════════════════════════════════════
+#  РАЗДЕЛ 25 — РАССМОТРЕНИЕ /cons (рассмотрители / модераторы)
+# ══════════════════════════════════════════════════════════════
+
+@router.callback_query(F.data.startswith("cons:"), IsStaffFilter())
+async def cons_reviewer_action(callback: CallbackQuery) -> None:
+    _, action, cons_id_str = callback.data.split(":")
+    cons_id = int(cons_id_str)
+    row     = await db_get_cons(cons_id)
+    if not row:
+        await callback.answer("❌ Жалоба не найдена.", show_alert=True)
+        return
+
+    reporter_id   = int(row["reporter_id"])
+    reviewer_name = callback.from_user.first_name or str(callback.from_user.id)
+
+    if action == "ok":
+        await db_update_cons_status(cons_id, "approved")
+        await callback.message.edit_reply_markup(reply_markup=None)
+        await callback.message.reply(
+            f"✅ *Жалоба #{cons_id} принята* рассмотрителем {reviewer_name}\n📤 Отправлена на модерацию.",
+            parse_mode="Markdown",
+        )
+        _try_notify(callback.message.bot, reporter_id,
+            f"{HEADER}\n{DIVIDER}\n\n✅ *ЖАЛОБА ПРОШЛА РАССМОТРЕНИЕ!*\n\n"
+            f"📌 Номер: *#{cons_id}*\n\n{DIVIDER}\n{FOOTER}")
+        report_text = (
+            f"{HEADER}\n{DIVIDER}\n\n📋 *ЖАЛОБА #{cons_id} — НА МОДЕРАЦИЮ*\n\n"
+            f"👤 Отправитель: `{reporter_id}`\n✅ Принята: {reviewer_name}\n📅 {_now_str()}\n\n"
+            f"{LINE}\n\n📝 *ТЕКСТ:*\n\n{row['message_text']}\n\n{LINE}\n{FOOTER}"
+        )
+        try:
+            await callback.message.bot.send_message(
+                REPORT_CHAT_ID, report_text, parse_mode="Markdown",
+                reply_markup=cons_mod_keyboard(cons_id),
+            )
+        except Exception as exc:
+            log.error("cons->report_chat: %s", exc)
+
+    elif action == "no":
+        await db_update_cons_status(cons_id, "rejected")
+        await callback.message.edit_reply_markup(reply_markup=None)
+        await callback.message.reply(
+            f"❌ *Жалоба #{cons_id} отклонена* рассмотрителем {reviewer_name}",
+            parse_mode="Markdown",
+        )
+        _try_notify(callback.message.bot, reporter_id,
+            f"{HEADER}\n{DIVIDER}\n\n❌ *ЖАЛОБА ОТКЛОНЕНА*\n\n"
+            f"📌 Номер: *#{cons_id}*\n\nПодайте новую жалобу через /cons\n\n{DIVIDER}\n{FOOTER}")
+
+    elif action == "redo":
+        await db_update_cons_status(cons_id, "rewrite_requested")
+        await callback.message.edit_reply_markup(reply_markup=None)
+        await callback.message.reply(
+            f"🔄 *Жалоба #{cons_id} — запрошена переработка* ({reviewer_name})",
+            parse_mode="Markdown",
+        )
+        asyncio.create_task(
+            callback.message.bot.send_message(
+                reporter_id,
+                f"{HEADER}\n{DIVIDER}\n\n🔄 *ЖАЛОБА ТРЕБУЕТ ДОРАБОТКИ*\n\n"
+                f"📌 Номер: *#{cons_id}*\n\nПерепишите и отправьте снова.\n\n{DIVIDER}",
+                parse_mode="Markdown",
+                reply_markup=cons_user_keyboard(cons_id),
+            )
+        )
+    await callback.answer()
+
+
+def _try_notify(bot: Bot, chat_id: int, text: str) -> None:
+    """Fire-and-forget уведомление — не блокирует хэндлер."""
+    asyncio.create_task(bot.send_message(chat_id, text, parse_mode="Markdown"))
+
+
+@router.callback_query(F.data.startswith("modcons:"), IsStaffFilter())
+async def cons_moderator_action(callback: CallbackQuery) -> None:
+    _, action, cons_id_str = callback.data.split(":")
+    cons_id     = int(cons_id_str)
+    row         = await db_get_cons(cons_id)
+    if not row:
+        await callback.answer("❌ Жалоба не найдена.", show_alert=True)
+        return
+    reporter_id = int(row["reporter_id"])
+
+    if action == "approve":
+        match  = re.search(r"(@\w+|\d{5,15})", row["message_text"])
+        target = match.group(1) if match else f"cons_{cons_id}"
+        await db_add_user(
+            target, None, "scammer",
+            f"Жалоба #{cons_id}: {row['message_text'][:200]}",
+            None, str(callback.from_user.id),
+        )
+        await db_update_cons_status(cons_id, "moderated_approved")
+        new_rank   = await update_mod_rank(callback.from_user.id, 1)
+        rank_emoji = RANK_EMOJI.get((await get_mod_rank(callback.from_user.id))[0], "🏅")
+        await callback.message.edit_reply_markup(reply_markup=None)
+        reply = f"✅ Жалоба #{cons_id} принята модератором {callback.from_user.first_name}."
+        if new_rank:
+            reply += f"\n\n✨ *ПОВЫШЕНИЕ!* ✨\n{rank_emoji} Новый ранг: *{new_rank}*"
+        await callback.message.reply(reply, parse_mode="Markdown")
+        _try_notify(callback.message.bot, reporter_id,
+            f"{HEADER}\n{DIVIDER}\n\n✅ *ВАША ЖАЛОБА ОДОБРЕНА!*\n\n"
+            f"📌 Номер: *#{cons_id}*\n\nСпасибо за вклад! 🙏\n\n{DIVIDER}\n{FOOTER}")
+
+    elif action == "reject":
+        await db_update_cons_status(cons_id, "moderated_rejected")
+        new_rank   = await update_mod_rank(callback.from_user.id, 1)
+        rank_emoji = RANK_EMOJI.get((await get_mod_rank(callback.from_user.id))[0], "🏅")
+        await callback.message.edit_reply_markup(reply_markup=None)
+        reply = f"❌ Жалоба #{cons_id} отклонена модератором {callback.from_user.first_name}."
+        if new_rank:
+            reply += f"\n\n✨ *ПОВЫШЕНИЕ!* ✨\n{rank_emoji} Новый ранг: *{new_rank}*"
+        await callback.message.reply(reply, parse_mode="Markdown")
+        _try_notify(callback.message.bot, reporter_id,
+            f"{HEADER}\n{DIVIDER}\n\n❌ *ВАША ЖАЛОБА ОТКЛОНЕНА*\n\n"
+            f"📌 Номер: *#{cons_id}*\n\nПодайте новую через /cons\n\n{DIVIDER}\n{FOOTER}")
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("cshow:"))
+async def cons_show_original(callback: CallbackQuery) -> None:
+    cons_id = int(callback.data.split(":")[1])
+    row     = await db_get_cons(cons_id)
+    if not row:
+        await callback.answer("❌ Жалоба не найдена.", show_alert=True)
+        return
+    await callback.message.answer(
+        f"{HEADER}\n{DIVIDER}\n\n📄 *ВАША ЖАЛОБА #{cons_id}:*\n\n"
+        f"{row['message_text']}\n\n{DIVIDER}\n{FOOTER}",
+        parse_mode="Markdown",
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("cnew:"))
+async def cons_rewrite(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
+    text = await get_text("cons_form")
+    await callback.message.answer(text, parse_mode="Markdown")
+    await state.set_state(ConsState.collecting)
+    await state.update_data(draft="", media_id=None, media_type=None)
+    fsm_schedule(callback.from_user.id, state)
+    await callback.answer()
+
+# ══════════════════════════════════════════════════════════════
+#  РАЗДЕЛ 26 — АПЕЛЛЯЦИИ
+# ══════════════════════════════════════════════════════════════
+
+@router.message(Command("appeal"))
+@router.message(F.text == "⚖️ АПЕЛЛЯЦИЯ")
+async def cmd_appeal(message: Message, state: FSMContext) -> None:
+    await state.clear()
+    if not await subscription_gate(message):
+        return
+    if await get_role(message.from_user.id):
+        await message.answer(
+            f"{HEADER}\n{DIVIDER}\n\n⚠️ Сотрудники не могут подавать апелляции.\n\n{FOOTER}",
+            parse_mode="Markdown",
+        )
+        return
+    await message.answer(
+        f"{HEADER}\n{DIVIDER}\n\n"
+        f"⚖️ *ПОДАЧА АПЕЛЛЯЦИИ*\n\n"
+        f"Апелляция — запрос на пересмотр вашей записи в базе.\n\n"
+        f"📋 *ТРЕБОВАНИЯ:*\n"
+        f"• Необходимо предоставить доказательства\n"
+        f"• Двухуровневое рассмотрение: рассмотритель → модератор\n"
+        f"• Ложные апелляции могут повлечь последствия\n\n"
+        f"{DIVIDER}\n\nВведите ваш *@username или ID* (тот, что занесён в базу):",
+        parse_mode="Markdown",
+        reply_markup=cancel_keyboard(),
+    )
+    await state.set_state(AppealState.target)
+    fsm_schedule(message.from_user.id, state)
+
+
+@router.message(AppealState.target)
+async def appeal_target(message: Message, state: FSMContext) -> None:
+    fsm_cancel(message.from_user.id)
+    target = validate_identifier(message.text or "")
+    if not target:
+        await message.answer("❌ Неверный формат! Введите @username или ID:")
+        fsm_schedule(message.from_user.id, state)
+        return
+
+    user_row = await db_get_user(target)
+    if not user_row:
+        await state.clear()
+        await message.answer(
+            f"{HEADER}\n{DIVIDER}\n\n⚠️ *ЗАПИСЬ НЕ НАЙДЕНА*\n\n"
+            f"`{target}` не найден в базе.\n\n{DIVIDER}\n{FOOTER}",
+            parse_mode="Markdown",
+        )
+        return
+
+    if await db_check_open_appeal(target):
+        await state.clear()
+        await message.answer(
+            f"{HEADER}\n{DIVIDER}\n\n⏳ *АПЕЛЛЯЦИЯ УЖЕ ПОДАНА*\n\n"
+            f"По записи `{target}` уже есть активная апелляция.\n\n{DIVIDER}\n{FOOTER}",
+            parse_mode="Markdown",
+        )
+        return
+
+    await state.update_data(target_id=target)
+    await message.answer(
+        f"{HEADER}\n{DIVIDER}\n\n⚖️ *АПЕЛЛЯЦИЯ*\n\n"
+        f"🎯 Запись: `{target}`\n"
+        f"📋 Причина внесения: *{sanitize(user_row['reason'])}*\n\n"
+        f"{DIVIDER}\n\n📝 Опишите *почему запись ошибочна* (от 30 до 1000 символов):",
+        parse_mode="Markdown",
+    )
+    await state.set_state(AppealState.reason)
+    fsm_schedule(message.from_user.id, state)
+
+
+@router.message(AppealState.reason)
+async def appeal_reason(message: Message, state: FSMContext) -> None:
+    fsm_cancel(message.from_user.id)
+    reason = (message.text or "").strip()
+    if len(reason) < 30:
+        await message.answer("❌ Слишком коротко! Минимум 30 символов:")
+        fsm_schedule(message.from_user.id, state)
+        return
+    if len(reason) > 1000:
+        await message.answer("❌ Максимум 1000 символов!")
+        fsm_schedule(message.from_user.id, state)
+        return
+    await state.update_data(reason=reason)
+    await message.answer(
+        f"{HEADER}\n{DIVIDER}\n\n🔗 *ДОКАЗАТЕЛЬСТВА*\n\n"
+        f"Прикрепите ссылки (скриншоты, переписки) или «-» если нет:",
+        parse_mode="Markdown",
+    )
+    await state.set_state(AppealState.evidence)
+    fsm_schedule(message.from_user.id, state)
+
+
+@router.message(AppealState.evidence)
+async def appeal_evidence(message: Message, state: FSMContext) -> None:
+    fsm_cancel(message.from_user.id)
+    evidence  = (message.text or "").strip()
+    data      = await state.get_data()
+    await state.clear()
+
+    target   = data.get("target_id", "")
+    reason   = data.get("reason", "")
+    ev_saved = evidence if evidence != "-" else None
+    username = message.from_user.username or ""
+
+    appeal_id = await db_create_appeal(
+        str(message.from_user.id), username, target, reason, ev_saved
+    )
+    if not appeal_id:
+        await message.answer("❌ Ошибка сохранения апелляции.")
+        return
+
+    await message.answer(
+        f"{HEADER}\n{DIVIDER}\n\n✅ *АПЕЛЛЯЦИЯ ПОДАНА!*\n\n"
+        f"📌 Номер: *#{appeal_id}*\n\n"
+        f"🔍 Рассмотрители изучат вашу апелляцию.\n"
+        f"📬 Вы получите уведомление о решении.\n\n"
+        f"⏱ Средний срок: 24–72 часа\n\n{DIVIDER}\n{FOOTER}",
+        parse_mode="Markdown",
+    )
+    log.info("appeal #%d from %d target=%s", appeal_id, message.from_user.id, target)
+
+    appeal_text = (
+        f"{HEADER}\n{DIVIDER}\n\n⚖️ *НОВАЯ АПЕЛЛЯЦИЯ #{appeal_id}*\n\n"
+        f"👤 Заявитель: `{message.from_user.id}`"
+        + (f" (@{username})" if username else "")
+        + f"\n🎯 Запись: `{target}`\n📅 {_now_str()}\n\n{LINE}\n\n"
+        f"📝 *ОБОСНОВАНИЕ:*\n\n{sanitize(reason)}\n\n"
+    )
+    if ev_saved:
+        appeal_text += f"🔗 *Доказательства:* {sanitize(ev_saved)}\n\n"
+    appeal_text += f"{LINE}\n{FOOTER}"
+
+    dest = APPEAL_CHAT_ID if APPEAL_CHAT_ID else CONSIDERATION_CHAT_ID
+    try:
+        await message.bot.send_message(
+            dest, appeal_text, parse_mode="Markdown",
+            reply_markup=appeal_reviewer_keyboard(appeal_id),
+        )
+    except Exception as exc:
+        log.error("appeal send error: %s", exc)
+
+
+@router.callback_query(F.data.startswith("aprev:"), IsStaffFilter())
+async def appeal_reviewer_action(callback: CallbackQuery) -> None:
+    parts     = callback.data.split(":")
+    action    = parts[1]
+    appeal_id = int(parts[2])
+    row       = await db_get_appeal(appeal_id)
+    if not row:
+        await callback.answer("❌ Апелляция не найдена.", show_alert=True)
+        return
+
+    rev_name     = callback.from_user.first_name or str(callback.from_user.id)
+    appellant_id = int(row["appellant_id"])
+
+    if action == "ok":
+        await db_update_appeal(
+            appeal_id, status="reviewer_approved", reviewer_id=str(callback.from_user.id)
+        )
+        await callback.message.edit_reply_markup(reply_markup=None)
+        await callback.message.reply(
+            f"✅ *Апелляция #{appeal_id}* одобрена рассмотрителем {rev_name}\n📤 Отправлена модератору.",
+            parse_mode="Markdown",
+        )
+        _try_notify(callback.message.bot, appellant_id,
+            f"{HEADER}\n{DIVIDER}\n\n🔍 *АПЕЛЛЯЦИЯ ПРОШЛА РАССМОТРЕНИЕ*\n\n"
+            f"📌 Номер: *#{appeal_id}*\n\nОжидайте решения модератора.\n\n{DIVIDER}\n{FOOTER}")
+
+        mod_text = (
+            f"{HEADER}\n{DIVIDER}\n\n⚖️ *АПЕЛЛЯЦИЯ #{appeal_id} — НА МОДЕРАЦИЮ*\n\n"
+            f"👤 Заявитель: `{row['appellant_id']}`"
+            + (f" (@{row['appellant_username']})" if row["appellant_username"] else "")
+            + f"\n🎯 Запись: `{row['target_id']}`\n✅ Рассмотритель: {rev_name}\n📅 {_now_str()}\n\n"
+            f"{LINE}\n\n📝 *ОБОСНОВАНИЕ:*\n\n{sanitize(row['reason'])}\n\n"
+        )
+        if row["evidence"]:
+            mod_text += f"🔗 *Доказательства:* {sanitize(row['evidence'])}\n\n"
+        mod_text += f"{LINE}\n{FOOTER}"
+        try:
+            await callback.message.bot.send_message(
+                REPORT_CHAT_ID, mod_text, parse_mode="Markdown",
+                reply_markup=appeal_mod_keyboard(appeal_id),
+            )
+        except Exception as exc:
+            log.error("appeal->mod: %s", exc)
+
+    elif action == "no":
+        await db_update_appeal(
+            appeal_id, status="rejected",
+            reviewer_id=str(callback.from_user.id),
+            reviewer_note="Отклонено рассмотрителем",
+        )
+        await callback.message.edit_reply_markup(reply_markup=None)
+        await callback.message.reply(
+            f"❌ *Апелляция #{appeal_id}* отклонена рассмотрителем {rev_name}",
+            parse_mode="Markdown",
+        )
+        _try_notify(callback.message.bot, appellant_id,
+            f"{HEADER}\n{DIVIDER}\n\n❌ *АПЕЛЛЯЦИЯ ОТКЛОНЕНА*\n\n"
+            f"📌 Номер: *#{appeal_id}*\n\nДля повторной подачи нужны новые доказательства.\n\n{DIVIDER}\n{FOOTER}")
+        await inc_stat("appeals_rejected")
+
+    elif action == "next":
+        rows     = await db_pending_appeals("pending", 5)
+        next_row = next((r for r in rows if r["id"] != appeal_id), None)
+        if next_row:
+            await callback.message.delete()
+            await _send_appeal_card(callback.message, next_row)
+        else:
+            await callback.message.edit_text(
+                f"{HEADER}\n{DIVIDER}\n\n✨ Апелляций больше нет!\n\n{FOOTER}",
+                parse_mode="Markdown",
+            )
+    await callback.answer()
+
+
+async def _send_appeal_card(message: Message, row: aiosqlite.Row) -> None:
+    text = (
+        f"{HEADER}\n{DIVIDER}\n\n⚖️ *АПЕЛЛЯЦИЯ #{row['id']}*\n\n"
+        f"👤 `{row['appellant_id']}`\n🎯 Запись: `{row['target_id']}`\n"
+        f"📅 {row['created_at']}\n\n{LINE}\n\n📝 {sanitize(row['reason'])}\n\n{LINE}"
+    )
+    await message.answer(
+        text, parse_mode="Markdown",
+        reply_markup=appeal_reviewer_keyboard(row["id"]),
+    )
+
+
+@router.callback_query(F.data.startswith("apmod:"), IsStaffFilter())
+async def appeal_mod_action(callback: CallbackQuery) -> None:
+    parts     = callback.data.split(":")
+    action    = parts[1]
+    appeal_id = int(parts[2])
+    row       = await db_get_appeal(appeal_id)
+    if not row:
+        await callback.answer("❌ Апелляция не найдена.", show_alert=True)
+        return
+
+    mod_name     = callback.from_user.first_name or str(callback.from_user.id)
+    appellant_id = int(row["appellant_id"])
+
+    if action == "approve":
+        deleted  = await db_delete_user(row["target_id"], str(callback.from_user.id))
+        await db_update_appeal(
+            appeal_id, status="approved",
+            moderator_id=str(callback.from_user.id),
+            moderator_note="Запись удалена из базы",
+        )
+        new_rank   = await update_mod_rank(callback.from_user.id, 1)
+        rank_emoji = RANK_EMOJI.get((await get_mod_rank(callback.from_user.id))[0], "🏅")
+        await inc_stat("appeals_approved")
+        await callback.message.edit_reply_markup(reply_markup=None)
+        reply = (
+            f"✅ Апелляция #{appeal_id} *ОДОБРЕНА* модератором {mod_name}.\n"
+            f"{'🗑 Запись удалена из базы.' if deleted else '⚠️ Запись уже не существовала.'}"
+        )
+        if new_rank:
+            reply += f"\n\n✨ *ПОВЫШЕНИЕ!* ✨\n{rank_emoji} Новый ранг: *{new_rank}*"
+        await callback.message.reply(reply, parse_mode="Markdown")
+        _try_notify(callback.message.bot, appellant_id,
+            f"{HEADER}\n{DIVIDER}\n\n🎉 *АПЕЛЛЯЦИЯ ОДОБРЕНА!*\n\n"
+            f"📌 Номер: *#{appeal_id}*\n\n✅ Запись удалена из базы ARION.\n\n{DIVIDER}\n{FOOTER}")
+        log.info("appeal #%d approved by %d, target=%s", appeal_id, callback.from_user.id, row["target_id"])
+
+    elif action == "reject":
+        await db_update_appeal(
+            appeal_id, status="rejected",
+            moderator_id=str(callback.from_user.id),
+            moderator_note="Отклонено модератором",
+        )
+        new_rank   = await update_mod_rank(callback.from_user.id, 1)
+        rank_emoji = RANK_EMOJI.get((await get_mod_rank(callback.from_user.id))[0], "🏅")
+        await inc_stat("appeals_rejected")
+        await callback.message.edit_reply_markup(reply_markup=None)
+        reply = f"❌ Апелляция #{appeal_id} *отклонена* модератором {mod_name}. Запись оставлена."
+        if new_rank:
+            reply += f"\n\n✨ *ПОВЫШЕНИЕ!* ✨\n{rank_emoji} Новый ранг: *{new_rank}*"
+        await callback.message.reply(reply, parse_mode="Markdown")
+        _try_notify(callback.message.bot, appellant_id,
+            f"{HEADER}\n{DIVIDER}\n\n❌ *АПЕЛЛЯЦИЯ ОТКЛОНЕНА*\n\n"
+            f"📌 Номер: *#{appeal_id}*\n\nЗапись оставлена. Новые доказательства → /appeal\n\n{DIVIDER}\n{FOOTER}")
+    await callback.answer()
+
+# ══════════════════════════════════════════════════════════════
+#  РАЗДЕЛ 27 — КОМАНДЫ МОДЕРАЦИИ (ИСПРАВЛЕНО: без get_members)
+# ══════════════════════════════════════════════════════════════
+
+async def _resolve_target(message: Message, target_text: str):
+    """
+    Разрешает цель команды модерации.
+    Принимает числовой ID или @username из reply.
+    Возвращает (user_id, display_name) или (None, None).
+    """
+    target_text = target_text.lstrip("@")
+
+    # Числовой ID — используем напрямую
+    if target_text.isdigit():
+        uid = int(target_text)
+        try:
+            member = await message.chat.get_member(uid)
+            return uid, member.user.first_name or str(uid)
+        except Exception:
+            return uid, str(uid)
+
+    # @username — проверяем reply или запрашиваем через API
+    if message.reply_to_message:
+        user = message.reply_to_message.from_user
+        if user.username and user.username.lower() == target_text.lower():
+            return user.id, user.first_name or user.username
+
+    # Попытка получить через get_chat (работает только если user писал боту)
+    try:
+        chat = await message.bot.get_chat(f"@{target_text}")
+        return chat.id, chat.first_name or target_text
+    except Exception:
+        pass
+
+    return None, None
+
+
+@router.message(Command("mute"), IsStaffFilter())
+async def cmd_mute(message: Message) -> None:
+    if message.chat.type == "private":
+        await message.answer("❌ Команда работает только в группах!")
+        return
+
+    args = message.text.split(maxsplit=2)
+    if len(args) < 2:
+        await message.answer(
+            "❌ Формат: `/mute @username|ID [время]`\n"
+            "Примеры: `/mute 123456 5 days`, `/mute @user 15 hours`",
+            parse_mode="Markdown",
+        )
+        return
+
+    uid, display_name = await _resolve_target(message, args[1])
+    if uid is None:
+        await message.answer(
+            f"❌ Пользователь `{args[1]}` не найден. "
+            f"Используйте числовой ID или ответьте на сообщение.",
+            parse_mode="Markdown",
+        )
+        return
+
+    duration: timedelta
+    if len(args) >= 3:
+        delta = parse_time_delta(args[2])
+        if not delta:
+            await message.answer(
+                "❌ Неверный формат времени. Пример: `5 days`, `15 hours`, `30 minutes`",
+                parse_mode="Markdown",
+            )
+            return
+        duration = delta
+    else:
+        duration = timedelta(days=random.randint(3, 7))
+
+    until_date = datetime.now() + duration
+    try:
+        await message.chat.restrict(
+            user_id=uid,
+            permissions=ChatPermissions(can_send_messages=False),
+            until_date=until_date,
+        )
+        await message.answer(
+            f"🔇 *{sanitize(display_name)}* замучен до {until_date.strftime('%d.%m.%Y %H:%M')}\n"
+            f"Модератор: {message.from_user.first_name}",
+            parse_mode="Markdown",
+        )
+        await mod_log(str(message.from_user.id), "mute", str(uid),
+                      f"до {until_date}, чат {message.chat.id}")
+    except Exception as exc:
+        await message.answer(f"❌ Ошибка: {exc}")
+
+
+@router.message(Command("remmute"), IsStaffFilter())
+async def cmd_remmute(message: Message) -> None:
+    if message.chat.type == "private":
+        await message.answer("❌ Команда работает только в группах!")
+        return
+
+    args = message.text.split()
+    if len(args) < 2:
+        await message.answer("❌ Формат: `/remmute @username|ID`", parse_mode="Markdown")
+        return
+
+    uid, display_name = await _resolve_target(message, args[1])
+    if uid is None:
+        await message.answer("❌ Пользователь не найден. Используйте числовой ID.", parse_mode="Markdown")
+        return
+
+    try:
+        await message.chat.restrict(
+            user_id=uid,
+            permissions=ChatPermissions(
+                can_send_messages=True,
+                can_send_media_messages=True,
+                can_send_other_messages=True,
+                can_add_web_page_previews=True,
+            ),
+        )
+        await message.answer(f"✅ Мут снят с *{sanitize(display_name)}*!", parse_mode="Markdown")
+        await mod_log(str(message.from_user.id), "unmute", str(uid), f"чат {message.chat.id}")
+    except Exception as exc:
+        await message.answer(f"❌ Ошибка: {exc}")
+
+
+@router.message(Command("ban"), IsStaffFilter())
+async def cmd_ban(message: Message) -> None:
+    if message.chat.type == "private":
+        await message.answer("❌ Команда работает только в группах!")
+        return
+
+    args = message.text.split(maxsplit=1)
+    if len(args) < 2:
+        await message.answer("❌ Формат: `/ban @username|ID`", parse_mode="Markdown")
+        return
+
+    uid, display_name = await _resolve_target(message, args[1])
+    if uid is None:
+        await message.answer("❌ Пользователь не найден. Используйте числовой ID.", parse_mode="Markdown")
+        return
+
+    try:
+        await message.chat.ban(uid)
+        await message.answer(
+            f"⛔ *{sanitize(display_name)}* забанен!\nМодератор: {message.from_user.first_name}",
+            parse_mode="Markdown",
+        )
+        await mod_log(str(message.from_user.id), "ban", str(uid), f"чат {message.chat.id}")
+    except Exception as exc:
+        await message.answer(f"❌ Ошибка: {exc}")
+
+
+@router.message(Command("remban"), IsStaffFilter())
+async def cmd_remban(message: Message) -> None:
+    if message.chat.type == "private":
+        await message.answer("❌ Команда работает только в группах!")
+        return
+
+    args = message.text.split()
+    if len(args) < 2:
+        await message.answer("❌ Формат: `/remban @username|ID`", parse_mode="Markdown")
+        return
+
+    uid, _ = await _resolve_target(message, args[1])
+    if uid is None:
+        await message.answer("❌ Укажите числовой ID пользователя.", parse_mode="Markdown")
+        return
+
+    try:
+        await message.chat.unban(uid)
+        await message.answer(f"✅ Бан снят с `{uid}`!", parse_mode="Markdown")
+        await mod_log(str(message.from_user.id), "unban", str(uid), f"чат {message.chat.id}")
+    except Exception as exc:
+        await message.answer(f"❌ Ошибка: {exc}")
+
+
+@router.message(Command("warn"), IsStaffFilter())
+async def cmd_warn(message: Message) -> None:
+    if message.chat.type == "private":
+        await message.answer("❌ Команда работает только в группах!")
+        return
+
+    args = message.text.split(maxsplit=2)
+    if len(args) < 2:
+        await message.answer(
+            "❌ Формат: `/warn @username|ID [время]`\n"
+            "Примеры: `/warn @user`, `/warn @user 7 days`",
+            parse_mode="Markdown",
+        )
+        return
+
+    uid, display_name = await _resolve_target(message, args[1])
+    if uid is None:
+        await message.answer("❌ Пользователь не найден. Используйте числовой ID.", parse_mode="Markdown")
+        return
+
+    expires_at: Optional[datetime] = None
+    if len(args) >= 3:
+        delta = parse_time_delta(args[2])
+        if not delta:
+            await message.answer(
+                "❌ Неверный формат времени. Пример: `7 days`, `30 days`",
+                parse_mode="Markdown",
+            )
+            return
+        if delta < timedelta(days=7):
+            await message.answer("❌ Минимальный срок варна — 7 дней!")
+            return
+        if delta > timedelta(days=365):
+            await message.answer("❌ Максимальный срок варна — 365 дней!")
+            return
+        expires_at = datetime.now() + delta
+
+    # add_warning теперь атомарно считает и возвращает кол-во
+    warnings_count = await add_warning(uid, message.chat.id, message.from_user.id, expires_at)
+    time_text = f"до {expires_at.strftime('%d.%m.%Y %H:%M')}" if expires_at else "бессрочно"
+
+    await message.answer(
+        f"⚠️ *{sanitize(display_name)}* получил предупреждение!\n"
+        f"📊 Активных варнов: {warnings_count}/3\n"
+        f"⏱ {time_text}\nМодератор: {message.from_user.first_name}",
+        parse_mode="Markdown",
+    )
+    await mod_log(str(message.from_user.id), "warn", str(uid),
+                  f"варн {warnings_count}/3, {time_text}")
+
+    if warnings_count >= 3:
+        try:
+            await message.chat.ban(uid)
+            await message.answer(
+                f"⛔ *{sanitize(display_name)}* автоматически забанен за 3 варна!",
+                parse_mode="Markdown",
+            )
+            await clear_warnings(uid, message.chat.id)
+            await mod_log(str(message.from_user.id), "auto_ban", str(uid), "3 варна")
+        except Exception as exc:
+            await message.answer(f"❌ Не удалось забанить: {exc}")
+
+
+@router.message(Command("remwarn"), IsStaffFilter())
+async def cmd_remwarn(message: Message) -> None:
+    if message.chat.type == "private":
+        await message.answer("❌ Команда работает только в группах!")
+        return
+
+    args = message.text.split()
+    if len(args) < 2:
+        await message.answer("❌ Формат: `/remwarn @username|ID`", parse_mode="Markdown")
+        return
+
+    uid, display_name = await _resolve_target(message, args[1])
+    if uid is None:
+        await message.answer("❌ Пользователь не найден. Используйте числовой ID.", parse_mode="Markdown")
+        return
+
+    await clear_warnings(uid, message.chat.id)
+    await message.answer(
+        f"✅ Все предупреждения сняты с *{sanitize(display_name)}*!",
+        parse_mode="Markdown",
+    )
+    await mod_log(str(message.from_user.id), "remwarn", str(uid), f"чат {message.chat.id}")
+
+# ══════════════════════════════════════════════════════════════
+#  РАЗДЕЛ 28 — КНОПКА «СОТРУДНИКИ+» / АНКЕТА
+# ══════════════════════════════════════════════════════════════
+
+@router.message(F.text == "💼 СОТРУДНИКИ+")
+async def button_join_team(message: Message) -> None:
+    settings = await get_recruitment_settings()
+    counts   = await get_staff_counts()
+
+    apply_kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📝 ПОДАТЬ ЗАЯВКУ", callback_data="job:apply")]
+    ])
+
+    if not settings or not settings["is_open"]:
+        await message.answer(
+            f"{HEADER}\n{DIVIDER}\n\n"
+            f"🤝 *Похоже, вы захотели стать частью команды Arion!*\n\n"
+            f"В данный момент команда полностью справляется со своей работой.\n"
+            f"Если хотите вступить — пишите главному администратору со своей заявкой.\n\n"
+            f"*Заполните по пунктам:*\n"
+            f"1) Ваш юзернейм\n2) Возраст\n3) Умение общаться (0–10)\n"
+            f"4) Почему подходите\n5) Почему хотите стать частью Arion\n\n"
+            f"{DIVIDER}\n{FOOTER}",
+            parse_mode="Markdown",
+            reply_markup=apply_kb,
+        )
+        return
+
+    await message.answer(
+        f"{HEADER}\n{DIVIDER}\n\n"
+        f"🤝 *Похоже, вы захотели стать частью команды Arion!*\n\n"
+        f"Мы нуждаемся в новых работниках!\n\n"
+        f"• Модераторы: `{counts.get('moderator', 0)}/{settings['needed_moderators']}`\n"
+        f"• Рассмотрители жалоб: `{counts.get('reviewer', 0)}/{settings['needed_reviewers']}`\n"
+        f"• Рассмотрители апелляций: `{counts.get('appeal_reviewer', 0)}/{settings['needed_appeal_reviewers']}`\n\n"
+        f"Заполните анкету — мы рассмотрим вашу кандидатуру!\n\n{DIVIDER}",
+        parse_mode="Markdown",
+        reply_markup=apply_kb,
+    )
+
+
+@router.callback_query(F.data == "job:apply")
+async def job_apply_start(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
+    await state.update_data(
+        applicant_id=callback.from_user.id,
+        username=callback.from_user.username or str(callback.from_user.id),
+    )
+    await callback.message.answer(
+        f"{HEADER}\n{DIVIDER}\n\n📝 *АНКЕТА КАНДИДАТА*\n\nШаг 1/4: Ваш возраст (только число):",
+        parse_mode="Markdown",
+        reply_markup=cancel_keyboard(),
+    )
+    await state.set_state(JobApplicationState.age)
+    await callback.answer()
+
+
+@router.message(JobApplicationState.age)
+async def job_apply_age(message: Message, state: FSMContext) -> None:
+    try:
+        age = int(message.text.strip())
+    except ValueError:
+        await message.answer("❌ Введите число!")
+        return
+    if not (14 <= age <= 100):
+        await message.answer("❌ Возраст от 14 до 100 лет:")
+        return
+    await state.update_data(age=age)
+    await message.answer(
+        "📝 Шаг 2/4: Оцените умение общаться (0–10).\nПример: `8` или `8/10`",
+        parse_mode="Markdown",
+    )
+    await state.set_state(JobApplicationState.rating)
+
+
+@router.message(JobApplicationState.rating)
+async def job_apply_rating(message: Message, state: FSMContext) -> None:
+    m = re.search(r"(\d+)", message.text or "")
+    if not m:
+        await message.answer("❌ Введите число от 0 до 10:")
+        return
+    rating = int(m.group(1))
+    if not (0 <= rating <= 10):
+        await message.answer("❌ Оценка от 0 до 10:")
+        return
+    await state.update_data(communication_rating=rating)
+    await message.answer(
+        "📝 Шаг 3/4: *Почему вы подходите на эту роль?*\n\n"
+        "Опишите навыки и опыт (20–500 символов):",
+        parse_mode="Markdown",
+    )
+    await state.set_state(JobApplicationState.reason_why)
+
+
+@router.message(JobApplicationState.reason_why)
+async def job_apply_reason_why(message: Message, state: FSMContext) -> None:
+    reason = (message.text or "").strip()
+    if len(reason) < 20:
+        await message.answer("❌ Слишком коротко! Минимум 20 символов:")
+        return
+    if len(reason) > 500:
+        await message.answer("❌ Максимум 500 символов!")
+        return
+    await state.update_data(reason_why=reason)
+    await message.answer(
+        "📝 Шаг 4/4: *Почему вы хотите стать частью Arion?*\n\n"
+        "Что вас привлекает? (20–500 символов):",
+        parse_mode="Markdown",
+    )
+    await state.set_state(JobApplicationState.reason_motivation)
+
+
+@router.message(JobApplicationState.reason_motivation)
+async def job_apply_motivation(message: Message, state: FSMContext) -> None:
+    motivation = (message.text or "").strip()
+    if len(motivation) < 20:
+        await message.answer("❌ Слишком коротко! Минимум 20 символов:")
+        return
+    if len(motivation) > 500:
+        await message.answer("❌ Максимум 500 символов!")
+        return
+
+    data = await state.get_data()
+    await state.clear()
+
+    app_id = await save_job_application(
+        data["applicant_id"], data["username"], data["age"],
+        data["communication_rating"], data["reason_why"], motivation,
+    )
+    await message.answer(
+        f"{HEADER}\n{DIVIDER}\n\n✅ *АНКЕТА ОТПРАВЛЕНА!*\n\n"
+        f"📌 Номер заявки: #{app_id}\n\n"
+        f"Мы рассмотрим вашу кандидатуру и свяжемся с вами. Спасибо! 🙏\n\n"
+        f"{DIVIDER}\n{FOOTER}",
+        parse_mode="Markdown",
+    )
+
+    admin_text = (
+        f"{HEADER}\n{DIVIDER}\n\n📋 *НОВАЯ ЗАЯВКА #{app_id}*\n\n"
+        f"👤 `{data['applicant_id']}` (@{data['username']})\n📅 {_now_str()}\n\n{LINE}\n"
+        f"• Возраст: {data['age']}\n"
+        f"• Коммуникация: {data['communication_rating']}/10\n\n"
+        f"📝 *Почему подходит:*\n{data['reason_why'][:400]}\n\n"
+        f"💚 *Мотивация:*\n{motivation[:400]}\n\n{LINE}\n{FOOTER}"
+    )
+    _try_notify(message.bot, MAIN_ADMIN_ID, admin_text)
+    await mod_log(str(data["applicant_id"]), "job_application", str(app_id),
+                  f"возраст {data['age']}")
+
+# ══════════════════════════════════════════════════════════════
+#  РАЗДЕЛ 29 — АПЕЛЛЯЦИИ: КОМАНДА /pending_appeals
+# ══════════════════════════════════════════════════════════════
+
+@router.message(Command("pending_appeals"), IsStaffFilter())
+async def cmd_pending_appeals(message: Message) -> None:
+    role = await get_role(message.from_user.id)
+    if role not in ("reviewer", "moderator", "admin", "head_admin"):
+        await message.answer("❌ Нет доступа.")
+        return
+
+    if role in ("reviewer", "admin", "head_admin"):
+        rows, stage = await db_pending_appeals("pending", 1), "pending"
+    else:
+        rows, stage = await db_pending_appeals("reviewer_approved", 1), "reviewer_approved"
+
+    if not rows:
+        await message.answer(
+            f"{HEADER}\n{DIVIDER}\n\n✨ Апелляций нет!\n\n{DIVIDER}\n{FOOTER}",
+            parse_mode="Markdown",
+        )
+        return
+
+    row  = rows[0]
+    text = (
+        f"{HEADER}\n{DIVIDER}\n\n⚖️ *АПЕЛЛЯЦИЯ #{row['id']}*\n\n"
+        f"👤 `{row['appellant_id']}`"
+        + (f" (@{row['appellant_username']})" if row["appellant_username"] else "")
+        + f"\n🎯 Запись: `{row['target_id']}`\n📅 {row['created_at']}\n\n"
+        f"{LINE}\n\n📝 *ОБОСНОВАНИЕ:*\n\n{sanitize(row['reason'])}\n\n"
+    )
+    if row["evidence"]:
+        text += f"🔗 *Доказательства:* {sanitize(row['evidence'])}\n\n"
+    text += LINE
+
+    kb = appeal_reviewer_keyboard(row["id"]) if stage == "pending" else appeal_mod_keyboard(row["id"])
+    await message.answer(text, parse_mode="Markdown", reply_markup=kb)
+
+# ══════════════════════════════════════════════════════════════
+#  РАЗДЕЛ 30 — АДМИН-ЦЕНТР / РАНГИ / СОТРУДНИКИ
+# ══════════════════════════════════════════════════════════════
+
+@router.message(Command("admin"), IsStaffFilter())
+async def cmd_admin(message: Message, state: FSMContext) -> None:
+    await state.clear()
+    role       = await get_role(message.from_user.id)
+    role_label = ROLE_LABELS.get(role, role)
+    cnt_users      = await db_count("users")
+    cnt_reports    = await db_count("reports", "status='pending'")
+    cnt_cons       = await db_count("cons_reports", "status='pending_review'")
+    cnt_appeals_p  = await db_count("appeals", "status='pending'")
+    cnt_appeals_r  = await db_count("appeals", "status='reviewer_approved'")
+    await message.answer(
+        f"{HEADER}\n{DIVIDER}\n\n"
+        f"🛠 *АДМИН-ЦЕНТР*\n\n"
+        f"👤 Роль: *{role_label}*\n\n"
+        f"👥 В базе: `{cnt_users}`\n"
+        f"🆕 Жалоб (report): `{cnt_reports}`\n"
+        f"📝 Жалоб (cons): `{cnt_cons}`\n"
+        f"⚖️ Апелляций (новых): `{cnt_appeals_p}`\n"
+        f"⚖️ Апелляций (у модераторов): `{cnt_appeals_r}`\n\n"
+        f"{DIVIDER}\n\n📋 *КОМАНДЫ:*\n\n"
+        f"/addscam — ➕ добавить в базу\n"
+        f"/delscam — 🗑 удалить из базы\n"
+        f"/addstaff — 👤 добавить сотрудника\n"
+        f"/delstaff — ❌ удалить сотрудника\n"
+        f"/pending — 📋 жалобы\n"
+        f"/pending_appeals — ⚖️ апелляции\n"
+        f"/channels — 📢 каналы подписки\n"
+        f"/export — 📊 экспорт CSV\n"
+        f"/broadcast — 📢 рассылка\n"
+        f"/myrank — 🏅 мой ранг\n"
+        f"/modstop — 🏆 топ модераторов\n"
+        f"/setrank — 👑 установить ранг\n"
+        f"/mute /remmute — 🔇 мут/размут\n"
+        f"/ban /remban — ⛔ бан/разбан\n"
+        f"/warn /remwarn — ⚠️ варн/снять",
+        parse_mode="Markdown",
+    )
+
+
+@router.message(Command("myrank"), IsStaffFilter())
+async def cmd_myrank(message: Message) -> None:
+    role = await get_role(message.from_user.id)
+    if role not in ("moderator", "reviewer", "admin", "head_admin"):
+        await message.answer("❌ Только для сотрудников.")
+        return
+    rank, total, rank_actions = await get_mod_rank(message.from_user.id)
+    need      = next((r for rn, r in MOD_RANKS if rn == rank), 0)
+    emoji     = RANK_EMOJI.get(rank, "🏅")
+    remaining = max(0, need - rank_actions)
+    text = (
+        f"{HEADER}\n{DIVIDER}\n\n{emoji} *ВАШ РАНГ*\n\n"
+        f"🏷 Ранг: *{rank}*\n"
+        f"📊 Всего обработано: `{total}`\n"
+        f"📈 В текущем ранге: `{rank_actions}` / `{need if need > 0 else '∞'}`\n"
+    )
+    if need > 0 and remaining > 0:
+        text += f"🎯 До следующего ранга: `{remaining}`\n"
+    elif rank == "Семицвет":
+        text += "\n🌈 Вы достигли высшего ранга!\n"
+    text += f"\n{DIVIDER}\n{FOOTER}"
+    await message.answer(text, parse_mode="Markdown")
+
+
+@router.message(Command("modstop"), IsStaffFilter())
+async def cmd_modstop(message: Message) -> None:
+    top = await get_top_moderators(10)
+    if not top:
+        await message.answer("📊 Нет данных.")
+        return
+    text = f"{HEADER}\n{DIVIDER}\n\n🏆 *ТОП МОДЕРАТОРОВ* 🏆\n\n"
+    for i, row in enumerate(top, 1):
+        emoji = RANK_EMOJI.get(row["rank"], "🏅")
+        text += f"{i}. {emoji} `{row['telegram_id']}` — {row['rank']} — {row['total_actions']} действий\n"
+    text += f"\n{DIVIDER}\n{FOOTER}"
+    await message.answer(text, parse_mode="Markdown")
+
+
+@router.message(Command("setrank"), IsHeadAdminFilter())
+async def cmd_setrank(message: Message) -> None:
+    args = message.text.split(maxsplit=2)
+    if len(args) < 3 or not args[1].isdigit() or args[2] not in RANK_EMOJI:
+        await message.answer(
+            f"❌ Формат: `/setrank <id> <ранг>`\nРанги: {', '.join(RANK_EMOJI)}",
+            parse_mode="Markdown",
+        )
+        return
+    if await set_mod_rank_by_admin(int(args[1]), args[2]):
+        await message.answer(
+            f"✅ Ранг *{args[2]}* установлен для `{args[1]}`",
+            parse_mode="Markdown",
+        )
+    else:
+        await message.answer("❌ Ошибка.")
+
+# ══════════════════════════════════════════════════════════════
+#  РАЗДЕЛ 31 — УПРАВЛЕНИЕ СОТРУДНИКАМИ
+# ══════════════════════════════════════════════════════════════
+
+@router.message(Command("addstaff"), IsStaffFilter())
+async def cmd_addstaff(message: Message, state: FSMContext) -> None:
+    await state.clear()
+    await message.answer(
+        f"{HEADER}\n{DIVIDER}\n\n👤 *ДОБАВЛЕНИЕ СОТРУДНИКА*\n\nВведите Telegram ID:",
+        parse_mode="Markdown",
+    )
+    await state.set_state(StaffAddState.target)
+    fsm_schedule(message.from_user.id, state)
+
+
+@router.message(StaffAddState.target)
+async def addstaff_target(message: Message, state: FSMContext) -> None:
+    fsm_cancel(message.from_user.id)
+    target = (message.text or "").strip()
+    if not target.isdigit():
+        await message.answer("❌ Введите числовой Telegram ID:")
+        fsm_schedule(message.from_user.id, state)
+        return
+    await state.update_data(target_id=int(target))
+    await message.answer(
+        f"🎯 ID: `{target}`\n\nВыберите роль:",
+        parse_mode="Markdown",
+        reply_markup=staff_roles_keyboard(),
+    )
+    await state.set_state(StaffAddState.role)
+    fsm_schedule(message.from_user.id, state)
+
+
+@router.callback_query(F.data.startswith("sr:"), IsStaffFilter())
+async def addstaff_role(callback: CallbackQuery, state: FSMContext) -> None:
+    fsm_cancel(callback.from_user.id)
+    role_key = callback.data.split(":")[1]
+    if role_key == "cancel":
+        await state.clear()
+        await callback.message.edit_text("❌ Отменено.")
+        await callback.answer()
+        return
+
+    data        = await state.get_data()
+    telegram_id = data["target_id"]
+    await state.clear()
+
+    username: Optional[str] = None
+    try:
+        chat     = await callback.message.bot.get_chat(telegram_id)
+        username = chat.username
+    except Exception:
+        pass
+
+    try:
+        async with mdb() as db:
+            await db.execute(
+                "INSERT OR REPLACE INTO staff (telegram_id, username, role, added_by, added_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (telegram_id, username, role_key, callback.from_user.id, _now_str()),
+            )
+            await db.commit()
+        invalidate_role(telegram_id)
+    except Exception as exc:
+        log.error("addstaff: %s", exc)
+        await callback.message.edit_text("❌ Ошибка сохранения.")
+        await callback.answer()
+        return
+
+    role_label = ROLE_LABELS.get(role_key, role_key)
+    await callback.message.edit_text(
+        f"{HEADER}\n{DIVIDER}\n\n✅ *СОТРУДНИК ДОБАВЛЕН!*\n\n"
+        f"🆔 `{telegram_id}`\n👤 Роль: *{role_label}*\n📅 {_now_str()}\n\n{DIVIDER}\n{FOOTER}",
+        parse_mode="Markdown",
+    )
+    await mod_log(str(callback.from_user.id), "add_staff", str(telegram_id), role_key)
+    await callback.answer()
+
+
+@router.message(Command("delstaff"), IsStaffFilter())
+async def cmd_delstaff(message: Message, state: FSMContext) -> None:
+    await state.clear()
+    await message.answer(
+        f"{HEADER}\n{DIVIDER}\n\n❌ *УДАЛЕНИЕ СОТРУДНИКА*\n\nВведите Telegram ID:",
+        parse_mode="Markdown",
+    )
+    await state.set_state(StaffDeleteState.target)
+    fsm_schedule(message.from_user.id, state)
+
+
+@router.message(StaffDeleteState.target)
+async def delstaff_execute(message: Message, state: FSMContext) -> None:
+    fsm_cancel(message.from_user.id)
+    target = (message.text or "").strip()
+    await state.clear()
+    if not target.isdigit():
+        await message.answer("❌ Введите числовой Telegram ID.")
+        return
+    tid = int(target)
+    if tid == MAIN_ADMIN_ID:
+        await message.answer("❌ Нельзя удалить главного администратора!")
+        return
+    try:
+        async with mdb() as db:
+            cur = await db.execute("DELETE FROM staff WHERE telegram_id=?", (tid,))
+            await db.commit()
+        invalidate_role(tid)
+        if cur.rowcount:
+            await message.answer(f"✅ Сотрудник `{tid}` удалён.", parse_mode="Markdown")
+            await mod_log(str(message.from_user.id), "del_staff", str(tid))
+        else:
+            await message.answer(f"⚠️ Сотрудник `{tid}` не найден.", parse_mode="Markdown")
+    except Exception as exc:
+        log.error("delstaff: %s", exc)
+        await message.answer("❌ Ошибка.")
+
+# ══════════════════════════════════════════════════════════════
+#  РАЗДЕЛ 32 — УПРАВЛЕНИЕ БАЗОЙ (addscam / delscam)
+# ══════════════════════════════════════════════════════════════
+
+@router.message(Command("addscam"), IsStaffFilter())
+async def cmd_addscam(message: Message, state: FSMContext) -> None:
+    await state.clear()
+    await message.answer(
+        f"{HEADER}\n{DIVIDER}\n\n➕ *ДОБАВЛЕНИЕ В БАЗУ*\n\nВведите @username или ID:",
+        parse_mode="Markdown",
+    )
+    await state.set_state(AdminAddState.target)
+    fsm_schedule(message.from_user.id, state)
+
+
+@router.message(AdminAddState.target)
+async def addscam_target(message: Message, state: FSMContext) -> None:
+    fsm_cancel(message.from_user.id)
+    identifier = validate_identifier(message.text or "")
+    if not identifier:
+        await message.answer("❌ Неверный формат:")
+        fsm_schedule(message.from_user.id, state)
+        return
+    await state.update_data(target_id=identifier)
+    await message.answer(
+        f"🎯 Цель: `{identifier}`\n\nВыберите статус:",
+        parse_mode="Markdown",
+        reply_markup=statuses_keyboard(),
+    )
+    await state.set_state(AdminAddState.status)
+    fsm_schedule(message.from_user.id, state)
+
+
+@router.callback_query(F.data.startswith("adm_s:"), IsStaffFilter())
+async def addscam_status(callback: CallbackQuery, state: FSMContext) -> None:
+    fsm_cancel(callback.from_user.id)
+    status = callback.data.split(":")[1]
+    if status == "cancel":
+        await state.clear()
+        await callback.message.edit_text("❌ Отменено.")
+        await callback.answer()
+        return
+    await state.update_data(status=status)
+    await callback.message.edit_text(
+        f"📝 Статус: *{status}*\n\nВведите причину добавления:",
+        parse_mode="Markdown",
+    )
+    await state.set_state(AdminAddState.reason)
+    fsm_schedule(callback.from_user.id, state)
+    await callback.answer()
+
+
+@router.message(AdminAddState.reason)
+async def addscam_reason(message: Message, state: FSMContext) -> None:
+    fsm_cancel(message.from_user.id)
+    reason = (message.text or "").strip()
+    if not reason:
+        await message.answer("❌ Введите причину:")
+        fsm_schedule(message.from_user.id, state)
+        return
+    await state.update_data(reason=reason)
+    await message.answer("🔗 Ссылка на доказательство или «-»:")
+    await state.set_state(AdminAddState.evidence)
+    fsm_schedule(message.from_user.id, state)
+
+
+@router.message(AdminAddState.evidence)
+async def addscam_evidence(message: Message, state: FSMContext) -> None:
+    fsm_cancel(message.from_user.id)
+    evidence = (message.text or "").strip()
+    data     = await state.get_data()
+    await state.clear()
+
+    target_id = data["target_id"]
+    username  = target_id if not target_id.isdigit() else None
+    success   = await db_add_user(
+        target_id, username, data["status"], data["reason"],
+        evidence if evidence != "-" else None,
+        str(message.from_user.id),
+    )
+    if success:
+        emoji = STATUS_EMOJI.get(data["status"], "✅")
+        await message.answer(
+            f"{HEADER}\n{DIVIDER}\n\n✅ *ДОБАВЛЕНО В БАЗУ!*\n\n"
+            f"{emoji} `{target_id}` → *{data['status']}*\n"
+            f"📋 Причина: {sanitize(data['reason'])}\n\n{DIVIDER}\n{FOOTER}",
+            parse_mode="Markdown",
+        )
+    else:
+        await message.answer("❌ Ошибка сохранения.")
+
+
+@router.message(Command("delscam"), IsStaffFilter())
+async def cmd_delscam(message: Message, state: FSMContext) -> None:
+    await state.clear()
+    await message.answer(
+        f"{HEADER}\n{DIVIDER}\n\n🗑 *УДАЛЕНИЕ ИЗ БАЗЫ*\n\nВведите @username или ID:",
+        parse_mode="Markdown",
+    )
+    await state.set_state(AdminDeleteState.target)
+    fsm_schedule(message.from_user.id, state)
+
+
+@router.message(AdminDeleteState.target)
+async def delscam_execute(message: Message, state: FSMContext) -> None:
+    fsm_cancel(message.from_user.id)
+    identifier = validate_identifier(message.text or "")
+    await state.clear()
+    if not identifier:
+        await message.answer("❌ Неверный формат.")
+        return
+    if await db_delete_user(identifier, str(message.from_user.id)):
+        await message.answer(f"✅ Запись `{identifier}` удалена.", parse_mode="Markdown")
+    else:
+        await message.answer(f"⚠️ Запись `{identifier}` не найдена.", parse_mode="Markdown")
+
+# ══════════════════════════════════════════════════════════════
+#  РАЗДЕЛ 33 — /pending (жалобы report)
+# ══════════════════════════════════════════════════════════════
+
+@router.message(Command("pending"), IsStaffFilter())
+async def cmd_pending(message: Message) -> None:
+    reports = await db_pending_reports(1)
+    if not reports:
+        await message.answer(
+            f"{HEADER}\n{DIVIDER}\n\n✨ Жалоб нет!\n\n{DIVIDER}\n{FOOTER}",
+            parse_mode="Markdown",
+        )
+        return
+    await _send_pending_report(message, reports[0])
+
+
+async def _send_pending_report(message: Message, report: aiosqlite.Row) -> None:
+    text = (
+        f"{HEADER}\n{DIVIDER}\n\n🆕 *ЖАЛОБА #{report['id']}*\n\n"
+        f"🎯 Цель: `{sanitize(report['target_un'])}`\n"
+        f"📋 Тип: *{sanitize(report['report_type'])}*\n"
+        f"📝 Описание:\n{sanitize(report['description'])}\n"
+    )
+    if report["evidence"]:
+        text += f"🔗 Доказательство: {sanitize(report['evidence'])}\n"
+    text += f"\n📅 {report['created_at']}\n👤 `{report['reporter_id']}`\n\n{DIVIDER}"
+    await message.answer(text, parse_mode="Markdown", reply_markup=pending_keyboard(report["id"]))
+
+
+@router.callback_query(F.data.startswith("pnd:"), IsStaffFilter())
+async def pending_action(callback: CallbackQuery) -> None:
+    _, action, report_id_str = callback.data.split(":")
+    report_id = int(report_id_str)
+
+    if action == "approve":
+        async with mdb() as db:
+            cur = await db.execute("SELECT * FROM reports WHERE id=?", (report_id,))
+            row = await cur.fetchone()
+        if row:
+            tid      = row["target_id"] if row["target_id"].isdigit() else row["target_un"].lstrip("@")
+            username = None if row["target_id"].isdigit() else row["target_un"].lstrip("@")
+            await db_add_user(tid, username, "scammer", row["description"],
+                              row["evidence"], str(callback.from_user.id))
+        await db_update_report_status(report_id, "approved")
+        new_rank   = await update_mod_rank(callback.from_user.id, 1)
+        rank_emoji = RANK_EMOJI.get((await get_mod_rank(callback.from_user.id))[0], "🏅")
+        text = f"{HEADER}\n{DIVIDER}\n\n✅ *Жалоба #{report_id} принята!*"
+        if new_rank:
+            text += f"\n\n✨ *ПОВЫШЕНИЕ!* ✨\n{rank_emoji} Новый ранг: *{new_rank}*"
+        await callback.message.edit_text(text, parse_mode="Markdown")
+
+    elif action == "reject":
+        await db_update_report_status(report_id, "rejected")
+        new_rank   = await update_mod_rank(callback.from_user.id, 1)
+        rank_emoji = RANK_EMOJI.get((await get_mod_rank(callback.from_user.id))[0], "🏅")
+        text = f"{HEADER}\n{DIVIDER}\n\n❌ *Жалоба #{report_id} отклонена.*"
+        if new_rank:
+            text += f"\n\n✨ *ПОВЫШЕНИЕ!* ✨\n{rank_emoji} Новый ранг: *{new_rank}*"
+        await callback.message.edit_text(text, parse_mode="Markdown")
+
+    elif action == "next":
+        rows   = await db_pending_reports(5)
+        next_r = next((r for r in rows if r["id"] != report_id), None)
+        if next_r:
+            await callback.message.delete()
+            await _send_pending_report(callback.message, next_r)
+        else:
+            await callback.message.edit_text(
+                f"{HEADER}\n{DIVIDER}\n\n✨ Жалоб больше нет!\n\n{FOOTER}",
+                parse_mode="Markdown",
+            )
+    await callback.answer()
+
+# ══════════════════════════════════════════════════════════════
+#  РАЗДЕЛ 34 — КАНАЛЫ
+# ══════════════════════════════════════════════════════════════
+
+@router.message(Command("channels"), IsStaffFilter())
+async def cmd_channels(message: Message, state: FSMContext) -> None:
+    await state.clear()
+    count = await db_count("required_channels", "active=1")
+    await message.answer(
+        f"{HEADER}\n{DIVIDER}\n\n📢 *КАНАЛЫ ПОДПИСКИ*\n\nАктивных: *{count}*",
+        parse_mode="Markdown",
+        reply_markup=channels_keyboard(),
+    )
+
+
+@router.callback_query(F.data == "chan:list", IsStaffFilter())
+async def channels_list(callback: CallbackQuery) -> None:
+    channels = await db_get_channels()
+    if not channels:
+        await callback.answer("Список пуст.", show_alert=True)
+        return
+    text = f"{HEADER}\n{DIVIDER}\n\n📋 *КАНАЛЫ:*\n\n"
+    for ch in channels:
+        text += f"• *{ch['title']}*\n  🆔 `{ch['channel_id']}`\n  🔗 {ch['channel_url']}\n\n"
+    text += f"{DIVIDER}\n{FOOTER}"
+    await callback.message.answer(text, parse_mode="Markdown")
+    await callback.answer()
+
+
+@router.callback_query(F.data == "chan:add", IsStaffFilter())
+async def channel_add_start(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
+    await callback.message.answer(
+        f"{HEADER}\n{DIVIDER}\n\nШаг 1/3: ID канала (пример: `-1001234567890`):",
+        parse_mode="Markdown",
+    )
+    await state.set_state(ChannelAddState.channel_id)
+    fsm_schedule(callback.from_user.id, state)
+    await callback.answer()
+
+
+@router.message(ChannelAddState.channel_id)
+async def channel_add_id(message: Message, state: FSMContext) -> None:
+    fsm_cancel(message.from_user.id)
+    await state.update_data(channel_id=(message.text or "").strip())
+    await message.answer("Шаг 2/3: Ссылка (пример: `https://t.me/channelname`):", parse_mode="Markdown")
+    await state.set_state(ChannelAddState.url)
+    fsm_schedule(message.from_user.id, state)
+
+
+@router.message(ChannelAddState.url)
+async def channel_add_url(message: Message, state: FSMContext) -> None:
+    fsm_cancel(message.from_user.id)
+    await state.update_data(url=(message.text or "").strip())
+    await message.answer("Шаг 3/3: Название (пример: `Arion News`):", parse_mode="Markdown")
+    await state.set_state(ChannelAddState.title)
+    fsm_schedule(message.from_user.id, state)
+
+
+@router.message(ChannelAddState.title)
+async def channel_add_title(message: Message, state: FSMContext) -> None:
+    fsm_cancel(message.from_user.id)
+    title = (message.text or "").strip()
+    data  = await state.get_data()
+    await state.clear()
+    if await db_add_channel(data["channel_id"], data["url"], title):
+        await message.answer(
+            f"{HEADER}\n{DIVIDER}\n\n✅ *КАНАЛ ДОБАВЛЕН!*\n\n"
+            f"📌 *{title}*\n🆔 `{data['channel_id']}`\n\n{DIVIDER}\n{FOOTER}",
+            parse_mode="Markdown",
+        )
+    else:
+        await message.answer("❌ Ошибка.")
+
+
+@router.callback_query(F.data == "chan:del", IsStaffFilter())
+async def channel_delete_start(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
+    channels = await db_get_channels()
+    if not channels:
+        await callback.answer("Список пуст.", show_alert=True)
+        return
+    text = f"{HEADER}\n{DIVIDER}\n\nВведите ID для удаления:\n\n"
+    for ch in channels:
+        text += f"• *{ch['title']}* — `{ch['channel_id']}`\n"
+    await callback.message.answer(text, parse_mode="Markdown")
+    await state.set_state(ChannelDeleteState.channel_id)
+    fsm_schedule(callback.from_user.id, state)
+    await callback.answer()
+
+
+@router.message(ChannelDeleteState.channel_id)
+async def channel_delete_execute(message: Message, state: FSMContext) -> None:
+    fsm_cancel(message.from_user.id)
+    cid = (message.text or "").strip()
+    await state.clear()
+    if await db_delete_channel(cid):
+        await message.answer(f"✅ Канал `{cid}` удалён.", parse_mode="Markdown")
+    else:
+        await message.answer(f"❌ Канал `{cid}` не найден.", parse_mode="Markdown")
+
+
+@router.callback_query(F.data == "chan:close")
+async def channel_close(callback: CallbackQuery) -> None:
+    await callback.message.delete()
+    await callback.answer()
+
+# ══════════════════════════════════════════════════════════════
+#  РАЗДЕЛ 35 — ИСТОРИЯ / СТАТИСТИКА / СБРОС / ЭКСПОРТ
+# ══════════════════════════════════════════════════════════════
+
+@router.message(F.text == "📜 ИСТОРИЯ")
+async def button_history(message: Message) -> None:
+    if not await subscription_gate(message):
+        return
+    rows = await db_get_history(str(message.from_user.id))
+    if not rows:
+        text = await get_text("history_empty")
+        await message.answer(text, parse_mode="Markdown")
+        return
+    text = f"{HEADER}\n{DIVIDER}\n\n📜 *АРХИВ ВАШИХ ПРОВЕРОК*\n\n"
+    for row in rows:
+        emoji = "🔥" if row["result"] == "found" else "🫧"
+        text += f"{emoji} `{row['target_id']}` — {row['checked_at']}\n"
+    text += f"\n{DIVIDER}\n{FOOTER}"
+    await message.answer(text, parse_mode="Markdown")
+
+
+@router.message(F.text == "📈 СТАТИСТИКА", IsStaffFilter())
+async def button_stats(message: Message) -> None:
+    stats = await get_all_stats()
+    text  = await get_text("stats")
+    cnt_bot_users  = await db_count("bot_users")
+    cnt_users      = await db_count("users")
+    cnt_scammers   = await db_count("users", "status='scammer'")
+    cnt_guarantors = await db_count("users", "status='guarantor'")
+    cnt_trusted    = await db_count("users", "status='trusted'")
+    cnt_reports_p  = await db_count("reports", "status='pending'")
+    cnt_appeals_p  = await db_count("appeals", "status='pending'")
+    text += (
+        f"👥 Пользователей бота: `{cnt_bot_users}`\n\n"
+        f"📂 Всего в базе: `{cnt_users}`\n"
+        f"🔥 Скамеров: `{cnt_scammers}`\n"
+        f"💎 Гарантов: `{cnt_guarantors}`\n"
+        f"🫧 Доверенных: `{cnt_trusted}`\n\n"
+        f"{DIVIDER}\n\n"
+        f"🔎 Проверок: `{stats['checks']}`\n"
+        f"🎯 Найдено: `{stats['found']}`\n"
+        f"✨ Чистых: `{stats['clean']}`\n"
+        f"🚨 Жалоб: `{stats['reports']}`\n"
+        f"🆕 Ожидают: `{cnt_reports_p}`\n\n"
+        f"{DIVIDER}\n\n"
+        f"⚖️ Апелляций (новых): `{cnt_appeals_p}`\n"
+        f"✅ Апелляций одобрено: `{stats['appeals_approved']}`\n\n"
+        f"{DIVIDER}\n💡 /admin — управление"
+    )
+    await message.answer(text, parse_mode="Markdown")
+
+
+@router.message(F.text == "🗑 СБРОС", IsStaffFilter())
+async def button_reset(message: Message) -> None:
+    await message.answer(
+        f"{HEADER}\n{DIVIDER}\n\n🗑 *СБРОС ДАННЫХ*\n\n⚠️ Выберите что очистить:\n❗ Необратимо!",
+        parse_mode="Markdown",
+        reply_markup=reset_keyboard(),
+    )
+
+
+@router.callback_query(F.data.startswith("reset:"), IsStaffFilter())
+async def reset_confirm(callback: CallbackQuery) -> None:
+    action = callback.data.split(":")[1]
+    if action == "cancel":
+        await callback.message.edit_text("❌ Сброс отменён.")
+        await callback.answer()
+        return
+    names = {"reports": "ЖАЛОБЫ", "users": "БАЗУ", "history": "ИСТОРИЮ", "all": "ВСЁ"}
+    confirm_kb = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="✅ ДА",  callback_data=f"resetok:{action}"),
+            InlineKeyboardButton(text="❌ НЕТ", callback_data="reset:cancel"),
+        ]
+    ])
+    await callback.message.edit_text(
+        f"⚠️ Сбросить *{names.get(action, action)}*?\n❗ Необратимо!",
+        parse_mode="Markdown",
+        reply_markup=confirm_kb,
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("resetok:"), IsStaffFilter())
+async def reset_execute(callback: CallbackQuery) -> None:
+    action = callback.data.split(":")[1]
+    await db_clear(action)
+    await callback.message.edit_text(
+        f"{HEADER}\n{DIVIDER}\n\n✅ *СБРОС ВЫПОЛНЕН!*\n\n"
+        f"Очищено: *{action.upper()}*\n\n{FOOTER}",
+        parse_mode="Markdown",
+    )
+    await callback.answer()
+    await mod_log(str(callback.from_user.id), "reset", action)
+
+
+@router.message(Command("export"), IsStaffFilter())
+async def cmd_export(message: Message) -> None:
+    total = await db_count("users")
+    if not total:
+        await message.answer("⚠️ База пуста.")
+        return
+    await message.answer("⏳ Формирую CSV...")
+    data     = await db_export_csv()
+    filename = f"scambase_{datetime.now().strftime('%Y%m%d_%H%M')}.csv"
+    await message.answer_document(
+        BufferedInputFile(data, filename),
+        caption=(
+            f"{HEADER}\n{DIVIDER}\n\n📊 *ЭКСПОРТ БАЗЫ*\n\n"
+            f"👥 Записей: `{total}`\n📅 {_now_str()}\n\n{FOOTER}"
+        ),
+        parse_mode="Markdown",
+    )
+
+# ══════════════════════════════════════════════════════════════
+#  РАЗДЕЛ 36 — РАССЫЛКА
+# ══════════════════════════════════════════════════════════════
+
+@router.message(Command("broadcast"), IsHeadAdminFilter())
+async def cmd_broadcast(message: Message, state: FSMContext) -> None:
+    await state.clear()
+    await message.answer(
+        f"{HEADER}\n{DIVIDER}\n\n📢 *РАССЫЛКА*\n\n"
+        "Введите текст (поддерживается Markdown).\n«-» для отмены:",
+        parse_mode="Markdown",
+    )
+    await state.set_state(BroadcastState.text)
+    fsm_schedule(message.from_user.id, state)
+
+
+@router.message(BroadcastState.text)
+async def broadcast_execute(message: Message, state: FSMContext) -> None:
+    fsm_cancel(message.from_user.id)
+    text = (message.text or "").strip()
+    await state.clear()
+    if text == "-":
+        await message.answer("❌ Рассылка отменена.")
+        return
+    users = await db_get_all_users()
+    if not users:
+        await message.answer("⚠️ Нет пользователей.")
+        return
+
+    sent       = 0
+    failed     = 0
+    status_msg = await message.answer(f"📢 Рассылка: 0/{len(users)}...")
+
+    for i, row in enumerate(users, 1):
+        try:
+            await message.bot.send_message(row["telegram_id"], text, parse_mode="Markdown")
+            sent += 1
+        except TelegramRetryAfter as exc:
+            await asyncio.sleep(exc.retry_after + 1)
+            try:
+                await message.bot.send_message(row["telegram_id"], text, parse_mode="Markdown")
+                sent += 1
+            except Exception:
+                failed += 1
+        except TelegramForbiddenError:
+            failed += 1
+        except TelegramBadRequest as exc:
+            if "can't parse entities" in str(exc):
+                try:
+                    await message.bot.send_message(row["telegram_id"], text)
+                    sent += 1
+                except Exception:
+                    failed += 1
+            else:
+                failed += 1
+        except Exception:
+            failed += 1
+
+        if i % BROADCAST_BATCH_SIZE == 0:
+            await asyncio.sleep(1)
+            try:
+                await status_msg.edit_text(f"📢 Рассылка: {i}/{len(users)}...")
+            except Exception:
+                pass
+        else:
+            await asyncio.sleep(BROADCAST_COOLDOWN)
+
+    await status_msg.edit_text(
+        f"{HEADER}\n{DIVIDER}\n\n✅ *РАССЫЛКА ЗАВЕРШЕНА!*\n\n"
+        f"📨 Отправлено: `{sent}`\n❌ Ошибок: `{failed}`\n\n{FOOTER}",
+        parse_mode="Markdown",
+    )
+    log.info("broadcast %d/%d by %d", sent, len(users), message.from_user.id)
+
+# ══════════════════════════════════════════════════════════════
+#  РАЗДЕЛ 37 — MINI APP
+# ══════════════════════════════════════════════════════════════
+
+@router.message(F.text == "📱 MINI APP")
+async def button_miniapp(message: Message) -> None:
+    await message.answer(
+        f"{HEADER}\n{DIVIDER}\n\n📱 *ARION MINI APP*\n\nБыстрый доступ к системе:",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(
+                text="🚀 ОТКРЫТЬ",
+                web_app=WebAppInfo(url=MINI_APP_URL),
+            )
+        ]]),
+    )
+
+# ══════════════════════════════════════════════════════════════
+#  РАЗДЕЛ 38 — ТОЧКА ВХОДА
+# ══════════════════════════════════════════════════════════════
+
+async def main() -> None:
+    log.info(HEADER)
+    log.info("💎 Arion ScamBase v15.0 — исправлены баги v14.1, безопасность, ISO-даты")
+
+    if not BOT_TOKEN or "ТОКЕН" in BOT_TOKEN:
+        log.error("❌ Укажите ARION_TOKEN в .env!")
+        log.error("Пример .env:")
+        log.error("  ARION_TOKEN=ваш_токен")
+        log.error("  MAIN_ADMIN_ID=123456789")
+        log.error("  CONSIDERATION_CHAT_ID=-1001234567890")
+        log.error("  REPORT_CHAT_ID=-1009876543210")
+        log.error("  APPEAL_CHAT_ID=-1009999999999")
+        log.error("  API_SECRET=ваш_секрет")
+        return
+
+    if MAIN_ADMIN_ID == 0:
+        log.error("❌ Укажите MAIN_ADMIN_ID в .env!")
+        return
+
+    await init_db()
+    asyncio.create_task(start_api_server())
+
+    bot = Bot(token=BOT_TOKEN)
+    dp  = Dispatcher(storage=MemoryStorage())
+    dp.include_router(router)
+
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            loop.add_signal_handler(sig, loop.stop)
+        except NotImplementedError:
+            pass
+
+    try:
+        await bot.delete_webhook(drop_pending_updates=True)
+    except Exception:
+        pass
+
+    await bot.set_my_commands([
+        BotCommand(command="start",           description="💎 Запуск"),
+        BotCommand(command="whoami",          description="🆔 Мой ID и роль"),
+        BotCommand(command="check",           description="🔎 Проверить"),
+        BotCommand(command="check_list",      description="🔎 Массовая проверка"),
+        BotCommand(command="cons",            description="📝 Жалоба (форма)"),
+        BotCommand(command="report",          description="🚨 Быстрая жалоба"),
+        BotCommand(command="appeal",          description="⚖️ Апелляция"),
+        BotCommand(command="admin",           description="🛠 Админ-центр"),
+        BotCommand(command="addscam",         description="➕ Добавить в базу"),
+        BotCommand(command="delscam",         description="🗑 Удалить из базы"),
+        BotCommand(command="addstaff",        description="👤 Добавить сотрудника"),
+        BotCommand(command="delstaff",        description="❌ Удалить сотрудника"),
+        BotCommand(command="channels",        description="📢 Каналы"),
+        BotCommand(command="pending",         description="📋 Жалобы"),
+        BotCommand(command="pending_appeals", description="⚖️ Апелляции"),
+        BotCommand(command="export",          description="📊 CSV"),
+        BotCommand(command="broadcast",       description="📢 Рассылка"),
+        BotCommand(command="myrank",          description="🏅 Мой ранг"),
+        BotCommand(command="modstop",         description="🏆 Топ модераторов"),
+        BotCommand(command="setrank",         description="👑 Установить ранг"),
+        BotCommand(command="mute",            description="🔇 Замутить"),
+        BotCommand(command="remmute",         description="🔊 Размутить"),
+        BotCommand(command="ban",             description="⛔ Забанить"),
+        BotCommand(command="remban",          description="✅ Разбанить"),
+        BotCommand(command="warn",            description="⚠️ Варн"),
+        BotCommand(command="remwarn",         description="🗑 Снять варны"),
+    ])
+
+    log.info("🟢 БОТ ЗАПУЩЕН v15.0")
+    await dp.start_polling(bot)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
